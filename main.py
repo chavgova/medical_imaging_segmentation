@@ -26,7 +26,7 @@ import argparse
 import subprocess
 import sys
 import warnings
-from typing import Any
+from typing import Any, Literal, get_args
 from pathlib import Path
 from pprint import pprint
 from shutil import copytree, rmtree
@@ -42,6 +42,7 @@ from functools import partial
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
 from ENet import ENet
+from UNet import UNet
 from utils import (Dcm,
                    class2one_hot,
                    probs2one_hot,
@@ -56,12 +57,25 @@ from losses import (CrossEntropy, Dice, DiceCE, Balance)
 import json
 import random
 
+Model = Literal["shallowcnn", "enet", "unet"]
+
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
 # Avoids the classes with C (often used for the number of Channel)
-datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["TOY2"] = {'K': 2, 'B': 2, 'model': 'shallowcnn'}
+datasets_params["SEGTHOR"] = {'K': 5, 'B': 8, 'model': 'enet'}
+datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'B': 8, 'model': 'enet'}
+
+
+def make_net(model: Model, in_channels: int, K: int) -> shallowCNN | ENet | UNet:
+    match model:
+        case "shallowcnn":
+            return shallowCNN(in_channels, K)
+        case "enet":
+            return ENet(in_channels, K, kernels=8, factor=2)
+        case "unet":
+            return UNet(in_channels, K, kernels=32, max_channels=512, depth=6, norm="instance",
+                        activation="leaky_relu", negative_slope=0.01, downsample="strided")
 
 def set_deterministic(seed: int) -> None:
     random.seed(seed)
@@ -184,10 +198,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
-    kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
-    factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
     in_channels = 2 * args.context_slices + 1
-    net = datasets_params[args.dataset]['net'](in_channels, K, kernels=kernels, factor=factor)
+    net = make_net(args.model, in_channels, K)
     net.init_weights()
     net.to(device)
 
@@ -461,6 +473,8 @@ def main():
                         help='Run one epoch; for SEGTHOR, create or reuse the two-patient smoke dataset.')
     parser.add_argument('--dataset', default=None, choices=datasets_params.keys(),
                         help='Defaults to SEGTHOR with --test_pipeline, otherwise TOY2.')
+    parser.add_argument('--model', default=None, choices=get_args(Model),
+                        help="Defaults to the dataset's model (shallowcnn for TOY2, enet for SEGTHOR).")
     parser.add_argument('--data_dir', type=Path, default=None,
                         help='Processed train/val directory; defaults to data/SEGTHOR_smoke for '
                              'a SEGTHOR smoke run, otherwise data/<dataset>.')
@@ -547,6 +561,8 @@ def main():
         parser.error('--clahe and --hu_min/--hu_max are mutually exclusive normalization choices')
     if args.dataset is None:
         args.dataset = 'SEGTHOR' if args.test_pipeline else 'TOY2'
+    if args.model is None:
+        args.model = datasets_params[args.dataset]['model']
     if args.dest is None:
         if not args.test_pipeline:
             parser.error('--dest is required unless --test_pipeline is set')
