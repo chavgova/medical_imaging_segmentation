@@ -305,7 +305,8 @@ def runTraining(args):
         else:
             fallback_epoch = args.balance_fallback_epoch
         loss_fn = Balance(idk=idk, alpha=args.balance_alpha, t=args.balance_t,
-                          normalized=args.balance_normalized, fallback_epoch=fallback_epoch)
+                          normalized=args.balance_normalized, fallback_epoch=fallback_epoch,
+                          inter=args.balance_inter)
     else:
         raise ValueError(f"Invalid loss function {args.loss_fn}")
 
@@ -520,13 +521,17 @@ def main():
     parser.add_argument('--balance_t', default=0.9, type=float,
                         help="Threshold t for --loss_fn balance (Xu et al. 2025): splits easy/hard pixels "
                              "for Intra-CBL and is also used in the Inter-CBL convergence check.")
-    parser.add_argument('--balance_normalized', action='store_true',
+    parser.add_argument('--balance_normalized', nargs='?', const='v1', default='none',
+                        choices=['none', 'v1', 'v2'],
                         help="Normalize Inter-CBL and Intra-CBL so it is a actual average, so that "
-                             "the weights sum to one (not part of Xu et al. 2025, but could help).")
+                             "the weights sum to one (not part of Xu et al. 2025, but could help). "
+                             "Without a value it is v1, v2 also fixes images without foreground.")
     parser.add_argument('--balance_fallback_epoch', default=-1, type=int,
                         help="Force InterCBL on if the paper's natural convergence criterion "
                              "hasn't triggered by this epoch. Value -1 means epochs // 2. "
                              "0 disables the fallback (paper-only convergence).")
+    parser.add_argument('--balance_inter', choices=['binary', 'multiclass'], default='binary',
+                        help="InterCBL (background vs foreground) or InterMCBL (a chain over all classes).")
     parser.add_argument('--opt', choices=["adam", "adamw"], default="adam", help="Optimizer used during training.")
     parser.add_argument('--lr', default=0.0005, type=float, help="Learning rate used during training.")
     parser.add_argument( '--context_slices', default=0, type=int, help="Number of neighboring slices before and after the current slice. 0 keeps 2D behavior.")
