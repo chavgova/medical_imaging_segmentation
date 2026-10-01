@@ -57,7 +57,7 @@ from losses import (CrossEntropy, Dice, DiceCE, Balance)
 import json
 import random
 
-Model = Literal["shallowcnn", "enet", "unet"]
+Model = Literal["shallowcnn", "enet", "unet-small", "unet-medium", "unet-large"]
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -73,7 +73,13 @@ def make_net(model: Model, in_channels: int, K: int) -> shallowCNN | ENet | UNet
             return shallowCNN(in_channels, K)
         case "enet":
             return ENet(in_channels, K, kernels=8, factor=2)
-        case "unet":
+        case "unet-small":
+            return UNet(in_channels, K, kernels=8, max_channels=64, depth=6, norm="instance",
+                        activation="leaky_relu", negative_slope=0.01, downsample="strided")
+        case "unet-medium":
+            return UNet(in_channels, K, kernels=16, max_channels=256, depth=6, norm="instance",
+                        activation="leaky_relu", negative_slope=0.01, downsample="strided")
+        case "unet-large":
             return UNet(in_channels, K, kernels=32, max_channels=512, depth=6, norm="instance",
                         activation="leaky_relu", negative_slope=0.01, downsample="strided")
 
