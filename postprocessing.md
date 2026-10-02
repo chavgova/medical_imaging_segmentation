@@ -2,7 +2,8 @@
 
 Post-processing refines predicted segmentation masks before evaluation by
 removing components, filling enclosed holes, or applying morphological opening
-and closing, or denoising salt-and-pepper artifacts. The functions operate on full 3D NumPy label maps,
+and closing, denoising salt-and-pepper artifacts, or applying class-specific
+anatomical component rules. The functions operate on full 3D NumPy label maps,
 not individual slices or probability maps. Label `0` is background.
 
 [`eval.py`](eval.py) loads compressed NIfTI files directly from a folder such as
@@ -108,6 +109,50 @@ spacing. This method can remove small valid structures as well as false positive
 It is available in the comparison script and through the Python callable
 interface, but is not an `eval.py` CLI choice.
 
+### Anatomy-aware component filtering
+
+Implemented as `anatomy_aware_filtering(volume, spacing, config)` in
+[`postprocessing.py`](postprocessing.py). Enable it with
+`--postprocessing anatomy_aware_filtering`.
+
+The method labels 3D components independently for each configured organ and
+measures their physical volume in mm³ using the NIfTI spacing. A component is
+retained only if it meets both its class-specific minimum physical volume and
+minimum fraction of that class's largest component. Each class can also cap the number of retained components, while `always_keep_largest` prevents an organ
+from disappearing. Unconfigured labels are unchanged and removed voxels become
+background; the method never adds or relabels foreground voxels.
+
+All method parameters are stored under `anatomy_aware_filtering` in
+[`postprocessing_config.json`](postprocessing_config.json):
+
+| JSON setting | Meaning |
+|---|---|
+| `connectivity` | 3D component connectivity: 6, 18, or 26. |
+| `classes` | Per-label rules; keys are positive integer label strings. |
+| `min_volume_mm3` | Smallest retained physical component volume; `0` disables this threshold. |
+| `min_relative_volume` | Smallest retained fraction of the largest same-class component, in `[0, 1]`. |
+| `max_components` | Maximum retained components, or `null` for no cap. |
+| `always_keep_largest` | Keep the largest component even when it fails a threshold. |
+
+The SegTHOR config uses the rule of removing regions
+smaller than 5% of the largest same-organ region. It conservatively permits
+multiple qualifying esophagus fragments, while heart, trachea, and aorta are
+capped at one component. The 5% rule was used by Feng et al. in
+[Multi-organ Segmentation using Simplified Dense V-net with Post-processing](https://ceur-ws.org/Vol-2349/SegTHOR2019_paper_4.pdf).
+Component rules should be retained only when validation improves, following
+the validation-selected approach described by Isensee et al. in
+[nnU-Net](https://doi.org/10.1038/s41592-020-01008-z).
+
+```sh
+python eval.py \
+    --pred_folder results/segthor_seed43/exp_L6_balance_normalized/results/pred_volumes \
+    --gt_pattern 'results/segthor_seed43/exp_L6_balance_normalized/results/gt_volumes/{id_}.nii.gz' \
+    --num_classes 5 --postprocessing anatomy_aware_filtering \
+    --postprocessing_config postprocessing_config.json \
+    --dest results/segthor_seed43/exp_L6_balance_normalized/results/anatomy_aware.csv \
+    --save --save_folder results/segthor_seed43/exp_L6_balance_normalized/results/anatomy_aware_volumes
+```
+
 ### Fill holes per class
 
 Implemented as `fill_holes(volume, classes=None, connectivity=6)` in
@@ -194,8 +239,8 @@ can cause. Both return a copy with the original shape and dtype.
 
 The neighborhood is measured in voxels, not millimeters; anisotropic voxel
 spacing makes its physical extent different along different axes. `--top_k`
-has no effect on either operation. Each evaluation run applies one selected
-method; these flags do not chain opening and closing.
+has no effect on either operation. Multiple methods can be listed after
+`--postprocessing`; they run from left to right.
 
 ```sh
 python eval.py --pred_folder volumes/segthor/ce \

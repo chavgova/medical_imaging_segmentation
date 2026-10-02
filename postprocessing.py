@@ -1,6 +1,6 @@
 """Post-processing functions for 3D numpy segmentation label maps."""
 
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 from scipy import ndimage
@@ -87,6 +87,76 @@ def remove_small_components(volume: np.ndarray, min_size: int) -> np.ndarray:
         keep = sizes >= min_size
         keep[0] = False
         result[mask & ~keep[components]] = 0
+    return result
+
+
+def anatomy_aware_filtering(
+    volume: np.ndarray,
+    spacing: Sequence[float],
+    config: Mapping[str, Any],
+) -> np.ndarray:
+    """Filter 3D components using class-specific physical-size rules.
+
+    Components are processed independently per configured foreground class.
+    A component must satisfy both the minimum physical volume and minimum
+    fraction of its class's largest component. The number retained can also be
+    capped per class. This function only removes voxels
+    """
+    volume = _validate_volume(volume)
+    spacing_array = np.asarray(spacing, dtype=np.float64)
+    if spacing_array.shape != (3,) or not np.isfinite(spacing_array).all() or np.any(spacing_array <= 0):
+        raise ValueError("spacing must contain 3 finite positive values")
+
+    connectivity = config.get("connectivity", 26)
+    
+    if connectivity not in (6, 18, 26):
+        raise ValueError("connectivity must be 6, 18, or 26.")
+    class_rules = config.get("classes")
+
+    structure = ndimage.generate_binary_structure(3, {6: 1, 18: 2, 26: 3}[connectivity])
+    voxel_volume_mm3 = float(np.prod(spacing_array))
+    result = volume.copy()
+
+    allowed_rule = {
+        "name",
+        "min_volume_mm3",  #min_volume_mm3 must be finite and non-negative
+        "min_relative_volume", #  min_relative_volume must be in [0, 1]
+        "max_components",
+        "always_keep_largest", # boolean 
+    }
+    for class_key, raw_rule in class_rules.items():
+        class_id = int(class_key)
+
+        min_volume_mm3 = raw_rule.get("min_volume_mm3", 0.0)
+        min_relative_volume = raw_rule.get("min_relative_volume", 0.0)
+        max_components = raw_rule.get("max_components")
+        always_keep_largest = raw_rule.get("always_keep_largest", True)
+
+        mask = volume == class_id
+        components, count = ndimage.label(mask, structure=structure)
+        if count == 0:
+            continue
+
+        voxel_counts = np.bincount(components.ravel())[1:]
+        component_volumes = voxel_counts.astype(np.float64) * voxel_volume_mm3
+        largest_volume = float(component_volumes.max())
+        keep_components = (
+            (component_volumes >= float(min_volume_mm3))
+            & (component_volumes >= float(min_relative_volume) * largest_volume)
+        )
+        largest_index = int(np.argmax(component_volumes))
+        if always_keep_largest:
+            keep_components[largest_index] = True
+
+        retained = np.flatnonzero(keep_components)
+        if max_components is not None and retained.size > max_components:
+            order = np.argsort(-component_volumes[retained], kind="stable")
+            retained = retained[order[:max_components]]
+
+        keep_lookup = np.zeros(count + 1, dtype=bool)
+        keep_lookup[retained + 1] = True
+        result[mask & ~keep_lookup[components]] = 0
+
     return result
 
 

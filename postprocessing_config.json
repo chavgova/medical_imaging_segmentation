@@ -1,0 +1,35 @@
+{
+  "anatomy_aware_filtering": {
+    "connectivity": 26,
+    "classes": {
+      "1":{
+        "name": "esophagus",
+        "min_volume_mm3": 0.0,
+        "min_relative_volume": 0.05, 
+        "max_components": null,
+        "always_keep_largest": true
+      },
+      "2":{
+        "name": "heart", 
+        "min_volume_mm3": 0.0, 
+        "min_relative_volume": 0.05, 
+        "max_components": 1,
+        "always_keep_largest": true 
+      },
+      "3": {
+        "name": "trachea",
+        "min_volume_mm3": 0.0,
+        "min_relative_volume": 0.05,
+        "max_components": 1,
+        "always_keep_largest": true
+      },
+      "4": {
+        "name": "aorta",
+        "min_volume_mm3": 0.0,
+        "min_relative_volume": 0.05,
+        "max_components": 1,
+        "always_keep_largest": true
+      }
+    }
+  }
+}

@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import json
 from functools import partial
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -11,7 +12,9 @@ import nibabel as nib
 
 from utils import tqdm_
 from metrics import dice, hausdorff_distance_95, average_surface_distance
-from postprocessing import keep_largest_connected_components, fill_holes, opening, closing, salt_and_pepper
+from postprocessing import (anatomy_aware_filtering, closing, fill_holes,
+                            keep_largest_connected_components, opening,
+                            salt_and_pepper)
 
 BACKGROUND_CLASS = 0
 
@@ -23,6 +26,20 @@ POSTPROCESSORS = {
     "closing": closing,
     "salt_and_pepper": salt_and_pepper,
 }
+CONFIGURED_POSTPROCESSORS = {"anatomy_aware_filtering": anatomy_aware_filtering}
+POSTPROCESSOR_NAMES = [*POSTPROCESSORS, *CONFIGURED_POSTPROCESSORS]
+
+class PostprocessingPipeline:
+    """applies ordered post-processing steps with per-patient spatial context"""
+
+    def __init__(self, steps: Sequence[tuple[Callable, bool]]):
+        self.steps = list(steps)
+
+    def __call__(self, volume: np.ndarray, spacing: Sequence[float]) -> np.ndarray:
+        result = volume
+        for processor, needs_spacing in self.steps:
+            result = processor(result, spacing=spacing) if needs_spacing else processor(result)
+        return result
 
 # such that all metrics have same signature: (pred, gt, spacing, c)
 def _dice_c(pred: np.ndarray, gt: np.ndarray, spacing, c: int = 1) -> float:
@@ -65,7 +82,7 @@ def discover_classes(gt_paths: Sequence[Path]) -> list[int]:
 
 
 def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: Sequence[int], metrics: Sequence[str] = None,
-                     postprocess: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                     postprocess: Optional[Callable[[np.ndarray], np.ndarray] | PostprocessingPipeline] = None,
                      save_folder: Optional[Path] = None) -> list[dict]:
 
     save_path = None
@@ -88,7 +105,10 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
     spacing = nib.load(str(gt_path)).header.get_zooms()[:3]
 
     if postprocess is not None:
-        pred_vol = postprocess(pred_vol)
+        if isinstance(postprocess, PostprocessingPipeline):
+            pred_vol = postprocess(pred_vol, spacing)
+        else:
+            pred_vol = postprocess(pred_vol)
 
     if metrics is None:
         metrics = ["dice", "hausdorff_distance_95", "average_surface_distance"]
@@ -115,7 +135,7 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
 
 
 def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[int] = None, metrics: Sequence[str] = None,
-                     postprocess: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                     postprocess: Optional[Callable[[np.ndarray], np.ndarray] | PostprocessingPipeline] = None,
                      save_folder: Optional[Path] = None) -> list[dict]:
 
     patient_ids = match_patients(pred_folder, gt_pattern)
@@ -173,19 +193,42 @@ def print_summary(summary: Sequence[dict], metrics: Sequence[str]) -> None:
             print(f"  {metric}: {row[f'{metric}_mean']:.4f} +/- {row[f'{metric}_std']:.4f}")
 
 
-def main(args: argparse.Namespace) -> None:
-    postprocess = None
-    if args.postprocessing != "none":
+def build_postprocessing_pipeline(args: argparse.Namespace) -> Optional[PostprocessingPipeline]:
+    if args.postprocessing == ["none"]:
+        return None
+
+    configured = {}
+    if "anatomy_aware_filtering" in args.postprocessing:
+        try:
+            with open(args.postprocessing_config) as config_file:
+                root_config = json.load(config_file)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cannot load post-processing config {args.postprocessing_config}: {error}") from error
+        configured = root_config.get("anatomy_aware_filtering")
+
+    steps: list[tuple[Callable, bool]] = []
+    for method in args.postprocessing:
+        if method == "anatomy_aware_filtering":
+            processor = partial(anatomy_aware_filtering, config=configured)
+            steps.append((processor, True))
+            continue
+
         options = {"classes": args.postprocessing_classes}
-        if args.connectivity is not None and args.postprocessing != "salt_and_pepper":
+        if args.connectivity is not None and method != "salt_and_pepper":
             options["connectivity"] = args.connectivity
-        if args.postprocessing == "largest_connected_components":
+        if method == "largest_connected_components":
             options["k"] = args.top_k
-        if args.postprocessing in ("opening", "closing"):
+        if method in ("opening", "closing"):
             options["iterations"] = args.iterations
-        if args.postprocessing == "salt_and_pepper":
+        if method == "salt_and_pepper":
             options["kernel_size"] = args.kernel_size
-        postprocess = partial(POSTPROCESSORS[args.postprocessing], **options)
+        steps.append((partial(POSTPROCESSORS[method], **options), False))
+
+    return PostprocessingPipeline(steps)
+
+
+def main(args: argparse.Namespace) -> None:
+    postprocess = build_postprocessing_pipeline(args)
     save_folder = None
     if args.save:
         save_folder = args.save_folder or args.dest.parent / f"{args.dest.stem}_volumes"
@@ -223,8 +266,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--num_classes", type=int, default=None,
                         help="Total number of classes, including background. "
                              "If omitted, inferred from the ground-truth volumes.")
-    parser.add_argument("--postprocessing", choices=["none", *POSTPROCESSORS], default="none",
-                        help="Technique applied to predictions in memory before scoring (default: none).")
+    parser.add_argument("--postprocessing", choices=["none", *POSTPROCESSOR_NAMES], nargs="+", default=["none"],
+                        help="Ordered techniques applied in memory before scoring (default: none)")
+    parser.add_argument("--postprocessing_config", type=Path,
+                        default=Path(__file__).with_name("postprocessing_config.json"),
+                        help="JSON parameters for configured methods such as anatomy_aware_filtering")
     parser.add_argument("--top_k", type=int, default=1,
                         help="Number of components per class for largest_connected_components only (default: 1).")
     parser.add_argument("--connectivity", type=int, choices=[6, 18, 26], default=None,
@@ -253,7 +299,11 @@ def get_args() -> argparse.Namespace:
         parser.error("--iterations must be a positive integer")
     if args.kernel_size < 1 or args.kernel_size % 2 == 0:
         parser.error("--kernel_size must be a positive odd integer")
-    if args.postprocessing == "salt_and_pepper" and args.connectivity is not None:
+    if "none" in args.postprocessing and args.postprocessing != ["none"]:
+        parser.error("--postprocessing none cannot be combined with another method")
+    if len(args.postprocessing) != len(set(args.postprocessing)):
+        parser.error("--postprocessing methods cannot be repeated")
+    if args.postprocessing == ["salt_and_pepper"] and args.connectivity is not None:
         parser.error("salt_and_pepper uses --kernel_size, not --connectivity")
     if args.save_folder is not None and not args.save:
         parser.error("--save_folder requires --save")
