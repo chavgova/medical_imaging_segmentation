@@ -8,3 +8,4 @@ scikit-image
 scipy
 matplotlib
 torchio>=0.20,<1
+transformers>=4.56

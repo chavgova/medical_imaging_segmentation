@@ -6,7 +6,7 @@ the nnU-Net Isensee et al. (2021), and Pytorch-UNet.
 """
 
 from collections import OrderedDict
-from typing import Literal, get_args
+from typing import Literal, Protocol, get_args
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,20 @@ Activation = Literal["relu", "leaky_relu", "prelu", "gelu", "silu"]
 Downsample = Literal["maxpool", "conv", "strided"]
 Upsample = Literal["transpose", "bilinear"]
 WeightInit = Literal["kaiming", "pytorch"]
+FoundationFusion = Literal["encoder", "decoder"]
+
+
+class FoundationModel(Protocol):
+    """A frozen model that turns the input into a (B, embed_dim, H / patch_size,
+    W / patch_size) feature map, e.g. FrozenDino in dino.py.
+
+    This class is not really used in code but is used for type checking
+    so that we get an error if we pass a model that's different from this."""
+
+    embed_dim: int
+    patch_size: int
+
+    def __call__(self, x: Tensor) -> Tensor: ...
 
 
 class UNet(nn.Module):
@@ -102,6 +116,18 @@ class UNet(nn.Module):
         dropout = 0 (nnU-Net)
         weight_init = "kaiming"
 
+    You can also use a foundation model like FrozenDino (dino.py) to add
+    additional features to the ones learned by U-Net. These features are
+    concatenated to the U-Net features at some level of the U that has the
+    same resolution. So for instance if the input image is 256x256 and
+    the foundation model has a patch size of 8, then we must concatenate
+    the features at the level of the U that has is 256 / 8 = 32x32. At
+    this level the features are first projected to a smaller (or bigger)
+    number of channels with a 1x1 conv, then they are concatenated along
+    the channel dimension. Since there are two sides of the U, the foundation
+    features can be concatenated either on the encoder side or the decoder
+    side.
+
     References:
 
         Ronneberger, Fischer & Brox (2015). U-Net: Convolutional Networks for
@@ -133,6 +159,9 @@ class UNet(nn.Module):
         upsample: Upsample = "transpose",
         dropout: float = 0.0,
         weight_init: WeightInit = "kaiming",
+        foundation_model: FoundationModel | None = None,
+        foundation_channels: int | None = None,  # after the 1x1 conv
+        foundation_fusion: FoundationFusion | None = None,
     ):
         super().__init__()
         assert padding in get_args(Padding), f"unknown padding {padding!r}"
@@ -157,6 +186,44 @@ class UNet(nn.Module):
             "leaky_relu",
             "prelu",
         ), "negative_slope is only used with activation='leaky_relu' or 'prelu'"
+        assert in_channels >= 1 and out_channels >= 1, "need at least one channel"
+        assert kernels >= 1 and factor >= 1, "kernels and factor must be at least 1"
+        assert depth >= 1, "depth must be at least 1"
+        assert kernel_size >= 1, "kernel_size must be positive"
+        assert 0.0 <= dropout <= 1.0, "dropout must be between 0 and 1"
+        assert (foundation_model is None) == (
+            foundation_fusion is None
+        ), "foundation_fusion must be given exactly when there is a foundation_model"
+        assert (
+            foundation_model is not None or foundation_channels is None
+        ), "foundation_channels is only used with a foundation_model"
+        assert foundation_fusion is None or foundation_fusion in get_args(
+            FoundationFusion
+        ), f"unknown foundation_fusion {foundation_fusion!r}"
+        assert (
+            foundation_channels is None or foundation_channels >= 1
+        ), "foundation_channels must be at least 1"
+        if foundation_model is not None:
+            assert padding == "same", "a foundation_model needs padding='same'"
+            assert isinstance(
+                foundation_model, nn.Module
+            ), "the foundation_model must be an nn.Module, to be moved and saved with the U-Net"
+            assert not any(
+                p.requires_grad for p in foundation_model.parameters()
+            ), "the foundation_model must be frozen"
+            assert (
+                isinstance(foundation_model.embed_dim, int)
+                and foundation_model.embed_dim >= 1
+            ), "the foundation_model's embed_dim must be a positive int"
+            patch_size = foundation_model.patch_size
+            assert (
+                isinstance(patch_size, int)
+                and patch_size >= 1
+                and patch_size & (patch_size - 1) == 0
+            ), "the foundation_model's patch_size must be a power of 2"
+            assert (
+                patch_size.bit_length() - 1 < depth
+            ), f"patch_size {patch_size} needs a level of the U below depth {depth}"
 
         # PyTorch's defaults: 0.01 for nn.LeakyReLU and 0.25 for nn.PReLU
         if negative_slope is None:
@@ -172,6 +239,8 @@ class UNet(nn.Module):
         self.downsample: Downsample = downsample
         self.upsample: Upsample = upsample
         self.weight_init: WeightInit = weight_init
+        self.in_channels: int = in_channels
+        self.out_channels: int = out_channels
 
         # All layers with weights, collected by the methods that build them so
         # init_weights can initialise them.
@@ -185,6 +254,32 @@ class UNet(nn.Module):
         if max_channels is not None:
             channels = [min(c, max_channels) for c in channels]
 
+        # The foundation model's features are concatenated at the level of the U
+        # with the same resolution as its patch grid
+        self.foundation_model = foundation_model
+        self.foundation_fusion: FoundationFusion | None = foundation_fusion
+        self.foundation_level: int | None = None
+        self.foundation_channels: int | None = None
+        self.foundation_embed_dim: int | None = None
+        self.foundation_patch_size: int | None = None
+        extra = 0
+        if foundation_model is not None:
+            self.foundation_level = foundation_model.patch_size.bit_length() - 1
+            assert 2**self.foundation_level == foundation_model.patch_size
+            extra = (
+                foundation_channels
+                if foundation_channels is not None
+                else channels[self.foundation_level] // 2
+            )
+            assert extra >= 1, "the 1x1 conv would have no output channels"
+            self.foundation_channels = extra
+            self.foundation_embed_dim = foundation_model.embed_dim
+            self.foundation_patch_size = foundation_model.patch_size
+
+        skip_channels = channels[:depth]
+        if foundation_fusion == "encoder" and self.foundation_level is not None:
+            skip_channels[self.foundation_level] += extra
+
         # With downsample="strided" (nnU-Net) there is no separate downsampling
         # step, instead the first conv of the next block has a stride of 2.
         stride = 2 if downsample == "strided" else 1
@@ -197,18 +292,18 @@ class UNet(nn.Module):
         for level in range(depth):
             self.encoder_blocks.append(
                 self.double_conv(
-                    in_channels if level == 0 else channels[level - 1],
+                    in_channels if level == 0 else skip_channels[level - 1],
                     channels[level],
                     stride=1 if level == 0 else stride,
                 )
             )
-            self.downsamplers.append(self.downsampling(channels[level]))
+            self.downsamplers.append(self.downsampling(skip_channels[level]))
 
         # Bottom of the U: two convs (e.g. 3x3). The paper puts dropout at
         # the end of the 'contracting path' so presumably after the
         # bottleneck
         self.bottleneck = self.double_conv(
-            channels[depth - 1], channels[depth], stride=stride
+            skip_channels[depth - 1], channels[depth], stride=stride
         )
         self.dropout = nn.Dropout2d(dropout)
 
@@ -228,7 +323,14 @@ class UNet(nn.Module):
             self.upsamplers.append(self.upsampling(below[level], upsampled[level]))
             self.decoder_blocks.append(
                 self.double_conv(
-                    channels[level] + upsampled[level],  # skip + upsampled
+                    skip_channels[level]
+                    + upsampled[level]
+                    + (
+                        extra
+                        if foundation_fusion == "decoder"
+                        and level == self.foundation_level
+                        else 0
+                    ),
                     decoder_out[level],
                     mid_channels=channels[level],
                 )
@@ -238,17 +340,74 @@ class UNet(nn.Module):
         self.output = nn.Conv2d(channels[0], out_channels, kernel_size=1)
         self.convs.append(self.output)
 
+        if foundation_model is not None:
+            conv = nn.Conv2d(
+                foundation_model.embed_dim, extra, kernel_size=1, bias=norm == "none"
+            )
+            self.convs.append(conv)
+            self.foundation_projection = nn.Sequential(
+                OrderedDict(
+                    conv=conv, norm=self.normalization(extra), act=self.nonlinearity()
+                )
+            )
+
     def forward(self, x: Tensor) -> Tensor:
+        assert (
+            x.dim() == 4 and x.size(1) == self.in_channels
+        ), f"expected (B, {self.in_channels}, H, W), got {tuple(x.shape)}"
+        batch, _, height, width = x.shape
         if self.padding == "same":
             multiple = 2**self.depth
             assert (
-                x.size(2) % multiple == 0 and x.size(3) % multiple == 0
+                height % multiple == 0 and width % multiple == 0
             ), f"input height and width must be divisible by {multiple}"
+
+        # get features from the foundation model
+        features = None
+        fused = 0
+        if self.foundation_model is not None:
+            assert isinstance(self.foundation_model, nn.Module)
+            assert (
+                self.foundation_channels is not None
+                and self.foundation_embed_dim is not None
+                and self.foundation_patch_size is not None
+            ), "foundation_channels, embed_dim and patch_size must be set with a foundation_model"
+            assert (
+                not self.foundation_model.training
+            ), "the foundation_model must stay in eval mode"
+            assert (
+                self.foundation_model.embed_dim == self.foundation_embed_dim
+                and self.foundation_model.patch_size == self.foundation_patch_size
+            ), "the foundation_model's embed_dim or patch_size changed after construction"
+            grid = (
+                height // self.foundation_patch_size,
+                width // self.foundation_patch_size,
+            )
+            raw = self.foundation_model(x)
+            assert raw.shape == (
+                batch,
+                self.foundation_embed_dim,
+                *grid,
+            ), f"foundation_model gave {tuple(raw.shape)}, expected {(batch, self.foundation_embed_dim, *grid)}"
+            features = self.foundation_projection(raw)
+            assert features.shape == (batch, self.foundation_channels, *grid)
 
         # Left of the U
         skips = []
-        for encoder_block, downsampler in zip(self.encoder_blocks, self.downsamplers):
+        for level, (encoder_block, downsampler) in enumerate(
+            zip(self.encoder_blocks, self.downsamplers)
+        ):
             x = encoder_block(x)
+            if (
+                features is not None
+                and self.foundation_fusion == "encoder"
+                and level == self.foundation_level
+            ):
+                assert (
+                    features.shape[2:] == x.shape[2:]
+                ), f"features {tuple(features.shape)} don't match level {level} {tuple(x.shape)}"
+                x = torch.cat([x, features], dim=1)
+                fused += 1
             skips.append(x)
             x = downsampler(x)
 
@@ -256,7 +415,9 @@ class UNet(nn.Module):
         x = self.dropout(self.bottleneck(x))
 
         # Right of the U
-        for upsampler, decoder_block in zip(self.upsamplers, self.decoder_blocks):
+        for level, upsampler, decoder_block in zip(
+            reversed(range(self.depth)), self.upsamplers, self.decoder_blocks
+        ):
             x = upsampler(x)
             skip = skips.pop()
 
@@ -267,9 +428,31 @@ class UNet(nn.Module):
             left = (skip.size(3) - x.size(3)) // 2
             skip = skip[:, :, top : top + x.size(2), left : left + x.size(3)]
 
-            x = decoder_block(torch.cat([skip, x], dim=1))
+            if (
+                features is not None
+                and self.foundation_fusion == "decoder"
+                and level == self.foundation_level
+            ):
+                assert (
+                    features.shape[2:] == x.shape[2:] == skip.shape[2:]
+                ), f"features {tuple(features.shape)} don't match level {level} {tuple(x.shape)}"
+                x = torch.cat([skip, x, features], dim=1)
+                fused += 1
+            else:
+                x = torch.cat([skip, x], dim=1)
+            x = decoder_block(x)
 
-        return self.output(x)
+        assert fused == (
+            features is not None
+        ), "the foundation features must be concatenated exactly once"
+        x = self.output(x)
+        assert self.padding != "same" or x.shape == (
+            batch,
+            self.out_channels,
+            height,
+            width,
+        ), f"output {tuple(x.shape)} doesn't match the input {(batch, height, width)}"
+        return x
 
     def double_conv(
         self,

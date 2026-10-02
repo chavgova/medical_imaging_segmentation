@@ -42,7 +42,8 @@ from functools import partial
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
 from ENet import ENet
-from UNet import UNet
+from UNet import UNet, FoundationFusion
+from dino import Dino, FrozenDino
 from utils import (Dcm,
                    class2one_hot,
                    probs2one_hot,
@@ -67,7 +68,16 @@ datasets_params["SEGTHOR"] = {'K': 5, 'B': 8, 'model': 'enet'}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'B': 8, 'model': 'enet'}
 
 
-def make_net(model: Model, in_channels: int, K: int) -> shallowCNN | ENet | UNet:
+def make_net(model: Model, in_channels: int, K: int, foundation_model: Dino | None = None,
+             foundation_channels: int | None = None,
+             foundation_fusion: FoundationFusion | None = None) -> shallowCNN | ENet | UNet:
+    assert foundation_model is None or model.startswith("unet"), \
+        f"--foundation_model only works with the U-Nets, not {model}"
+    assert (foundation_model is None) == (foundation_fusion is None), \
+        "--foundation_fusion must be given exactly when there is a --foundation_model"
+    assert foundation_model is not None or foundation_channels is None, \
+        "--foundation_channels is only used with a --foundation_model"
+    frozen = FrozenDino(foundation_model) if foundation_model is not None else None
     match model:
         case "shallowcnn":
             return shallowCNN(in_channels, K)
@@ -75,13 +85,19 @@ def make_net(model: Model, in_channels: int, K: int) -> shallowCNN | ENet | UNet
             return ENet(in_channels, K, kernels=8, factor=2)
         case "unet-small":
             return UNet(in_channels, K, kernels=8, max_channels=64, depth=6, norm="instance",
-                        activation="leaky_relu", negative_slope=0.01, downsample="strided")
+                        activation="leaky_relu", negative_slope=0.01, downsample="strided",
+                        foundation_model=frozen, foundation_channels=foundation_channels,
+                        foundation_fusion=foundation_fusion)
         case "unet-medium":
             return UNet(in_channels, K, kernels=16, max_channels=256, depth=6, norm="instance",
-                        activation="leaky_relu", negative_slope=0.01, downsample="strided")
+                        activation="leaky_relu", negative_slope=0.01, downsample="strided",
+                        foundation_model=frozen, foundation_channels=foundation_channels,
+                        foundation_fusion=foundation_fusion)
         case "unet-large":
             return UNet(in_channels, K, kernels=32, max_channels=512, depth=6, norm="instance",
-                        activation="leaky_relu", negative_slope=0.01, downsample="strided")
+                        activation="leaky_relu", negative_slope=0.01, downsample="strided",
+                        foundation_model=frozen, foundation_channels=foundation_channels,
+                        foundation_fusion=foundation_fusion)
 
 def set_deterministic(seed: int) -> None:
     random.seed(seed)
@@ -205,7 +221,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 
     K: int = datasets_params[args.dataset]['K']
     in_channels = 2 * args.context_slices + 1
-    net = make_net(args.model, in_channels, K)
+    net = make_net(args.model, in_channels, K, args.foundation_model, args.foundation_channels,
+                   args.foundation_fusion)
     net.init_weights()
     net.to(device)
 
@@ -482,6 +499,18 @@ def main():
                         help='Defaults to SEGTHOR with --test_pipeline, otherwise TOY2.')
     parser.add_argument('--model', default=None, choices=get_args(Model),
                         help="Defaults to the dataset's model (shallowcnn for TOY2, enet for SEGTHOR).")
+    parser.add_argument('--foundation_model', default=None, choices=get_args(Dino),
+                        help="Frozen foundation model whose patch features are concatenated into the "
+                             "U-Net, at the level with the same resolution (16x16).")
+    parser.add_argument('--foundation_channels', default=None, type=int,
+                        help="Since foundation model features can be big we might want to "
+                             "shrink them with a 1x1 conv before concatenating them into the U-Net. "
+                             "Defaults to half of the U-Net's channels at that level.")
+    parser.add_argument('--foundation_fusion', default=None, choices=get_args(FoundationFusion),
+                        help="There are two places where the resolution of the U-Net feature are "
+                        "the same as the foundation model's patch features: once in the encoder, once in the decoder. "
+                        "I think the decoder is better since the DINO features are already contextualized. "
+                        "But we could try both.")
     parser.add_argument('--data_dir', type=Path, default=None,
                         help='Processed train/val directory; defaults to data/SEGTHOR_smoke for '
                              'a SEGTHOR smoke run, otherwise data/<dataset>.')
@@ -574,6 +603,18 @@ def main():
         args.dataset = 'SEGTHOR' if args.test_pipeline else 'TOY2'
     if args.model is None:
         args.model = datasets_params[args.dataset]['model']
+    if args.context_slices < 0:
+        parser.error('--context_slices must be 0 or more')
+    if args.foundation_model is None:
+        if args.foundation_fusion is not None or args.foundation_channels is not None:
+            parser.error('--foundation_fusion and --foundation_channels need a --foundation_model')
+    else:
+        if not args.model.startswith('unet'):
+            parser.error(f'--foundation_model only works with the U-Nets, not --model {args.model}')
+        if args.foundation_fusion is None:
+            parser.error('--foundation_model needs --foundation_fusion encoder or decoder')
+        if args.foundation_channels is not None and args.foundation_channels < 1:
+            parser.error('--foundation_channels must be at least 1')
     if args.dest is None:
         if not args.test_pipeline:
             parser.error('--dest is required unless --test_pipeline is set')
