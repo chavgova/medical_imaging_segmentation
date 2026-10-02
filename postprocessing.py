@@ -4,7 +4,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 from scipy import ndimage
-
+import pydensecrf.densecrf as dcrf
 
 def _validate_volume(volume: np.ndarray) -> np.ndarray:
     volume = np.asarray(volume)
@@ -158,6 +158,56 @@ def anatomy_aware_filtering(
         result[mask & ~keep_lookup[components]] = 0
 
     return result
+
+
+def dense_crf(volume: np.ndarray, probabilities: np.ndarray, image: np.ndarray, spacing: Sequence[float], config: Mapping[str, Any]) -> np.ndarray:
+    """Refines a multiclass 3D label map with CT-aware dense CRF inference"""
+
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    image = np.asarray(image, dtype=np.float32)
+    spacing_array = np.asarray(spacing, dtype=np.float32)
+
+    foreground = probabilities[..., 1:].sum(axis=-1) >= config["roi_foreground_probability"]
+    foreground_voxels = np.argwhere(foreground)
+    if foreground_voxels.size == 0:
+        return volume.copy()
+
+    margin = np.ceil(config["roi_margin_mm"] / spacing_array).astype(int)
+    start =np.maximum(foreground_voxels.min(axis=0) - margin,0)
+    stop = np.minimum(foreground_voxels.max(axis=0)+ margin + 1,volume.shape)
+    roi = tuple(slice(int(lo), int(hi)) for lo, hi in zip(start, stop))
+
+    roi_probabilities = np.moveaxis(probabilities[roi], -1, 0)
+    epsilon = config["probability_epsilon"]
+    roi_probabilities = np.clip(roi_probabilities, epsilon,1.0)
+    roi_probabilities /= roi_probabilities.sum(axis=0, keepdims=True)  
+
+    class_count, *roi_shape = roi_probabilities.shape  
+    voxel_count = int(np.prod(roi_shape))  
+    crf = dcrf.DenseCRF(voxel_count, class_count) 
+    unary = -np.log(roi_probabilities).reshape(class_count, -1)   
+    crf.setUnaryEnergy(np.ascontiguousarray(unary, dtype=np.float32))
+ 
+    coordinates = np.indices(roi_shape, dtype=np.float32).reshape(3, -1)
+    coordinates *= spacing_array[:, None]  
+ 
+    spatial_sigma = np.asarray(config["spatial_sigma_mm"], dtype=np.float32)[:, None]
+    spatial_features = np.ascontiguousarray(coordinates / spatial_sigma, dtype=np.float32)
+    crf.addPairwiseEnergy(spatial_features, compat=config["spatial_weight"], kernel=dcrf.DIAG_KERNEL, normalization=dcrf.NORMALIZE_SYMMETRIC)
+
+    bilateral_sigma = np.asarray(config["bilateral_spatial_sigma_mm"], dtype=np.float32)[:, None]
+    intensity = image[roi].reshape(1, -1) / config["bilateral_intensity_sigma_hu"]
+    bilateral_features = np.vstack((coordinates / bilateral_sigma, intensity))
+    crf.addPairwiseEnergy( 
+        np.ascontiguousarray(bilateral_features, dtype=np.float32),
+        compat=config["bilateral_weight"], 
+        kernel=dcrf.DIAG_KERNEL, 
+        normalization=dcrf.NORMALIZE_SYMMETRIC)
+ 
+    posterior = np.asarray(crf.inference(config["iterations"]), dtype=np.float32)
+    result = volume.copy()
+    result[roi] = posterior.argmax(axis=0).reshape(roi_shape).astype(volume.dtype)
+    return result 
 
 
 def fill_holes(

@@ -7,5 +7,6 @@ pillow
 scikit-image
 scipy
 matplotlib
+pydensecrf2==1.1
 torchio>=0.20,<1
 transformers>=4.56

@@ -12,7 +12,7 @@ import nibabel as nib
 
 from utils import tqdm_
 from metrics import dice, hausdorff_distance_95, average_surface_distance
-from postprocessing import (anatomy_aware_filtering, closing, fill_holes,
+from postprocessing import (anatomy_aware_filtering, closing, dense_crf, fill_holes,
                             keep_largest_connected_components, opening,
                             salt_and_pepper)
 
@@ -26,19 +26,27 @@ POSTPROCESSORS = {
     "closing": closing,
     "salt_and_pepper": salt_and_pepper,
 }
-CONFIGURED_POSTPROCESSORS = {"anatomy_aware_filtering": anatomy_aware_filtering}
+CONFIGURED_POSTPROCESSORS = {"anatomy_aware_filtering": anatomy_aware_filtering, "dense_crf": dense_crf}
 POSTPROCESSOR_NAMES = [*POSTPROCESSORS, *CONFIGURED_POSTPROCESSORS]
 
 class PostprocessingPipeline:
     """applies ordered post-processing steps with per-patient spatial context"""
 
-    def __init__(self, steps: Sequence[tuple[Callable, bool]]):
+    def __init__(self, steps: Sequence[tuple[Callable, Sequence[str]]],
+                 probability_pattern: Optional[str] = None,
+                 image_pattern: Optional[str] = None):
         self.steps = list(steps)
+        self.probability_pattern = probability_pattern
+        self.image_pattern = image_pattern
 
-    def __call__(self, volume: np.ndarray, spacing: Sequence[float]) -> np.ndarray:
+    def __call__(self, volume: np.ndarray, spacing: Sequence[float],
+                 probabilities: Optional[np.ndarray] = None,
+                 image: Optional[np.ndarray] = None) -> np.ndarray:
         result = volume
-        for processor, needs_spacing in self.steps:
-            result = processor(result, spacing=spacing) if needs_spacing else processor(result)
+        context = {"spacing": spacing, "probabilities": probabilities, "image": image}
+        for processor, context_names in self.steps:
+            kwargs = {name: context[name] for name in context_names}
+            result = processor(result, **kwargs)
         return result
 
 # such that all metrics have same signature: (pred, gt, spacing, c)
@@ -54,7 +62,7 @@ METRIC_FUNCS = {
 
 
 def load_volume(path: Path) -> np.ndarray:
-    """Load a 3D label-map volume from a .nii.gz file as a numpy array."""
+    """gets a NIfTI array from a .nii.gz file"""
     return np.asarray(nib.load(str(path)).dataobj)
 
 
@@ -83,7 +91,9 @@ def discover_classes(gt_paths: Sequence[Path]) -> list[int]:
 
 def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: Sequence[int], metrics: Sequence[str] = None,
                      postprocess: Optional[Callable[[np.ndarray], np.ndarray] | PostprocessingPipeline] = None,
-                     save_folder: Optional[Path] = None) -> list[dict]:
+                     save_folder: Optional[Path] = None,
+                     probability_path: Optional[Path] = None,
+                     image_path: Optional[Path] = None) -> list[dict]:
 
     save_path = None
     if save_folder is not None:
@@ -106,8 +116,10 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
 
     if postprocess is not None:
         if isinstance(postprocess, PostprocessingPipeline):
-            pred_vol = postprocess(pred_vol, spacing)
-        else:
+            probabilities = load_volume(probability_path) if probability_path is not None else None
+            image = load_volume(image_path) if image_path is not None else None   
+            pred_vol = postprocess(pred_vol, spacing, probabilities, image)
+        else: 
             pred_vol = postprocess(pred_vol)
 
     if metrics is None:
@@ -147,11 +159,20 @@ def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[i
         classes = list(range(num_classes))
 
     rows: list[dict] = []
-    for pid in tqdm_(patient_ids):
-        pred_path = pred_folder / f"{pid}.nii.gz"
+    for pid in tqdm_(patient_ids):  
+        pred_path = pred_folder/ f"{pid}.nii.gz" 
         gt_path = Path(gt_pattern.format(id_=pid))
-        rows.extend(evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics,
-                                     postprocess=postprocess, save_folder=save_folder))
+        probability_path = None
+        image_path = None 
+        
+        if isinstance(postprocess, PostprocessingPipeline): 
+            if postprocess.probability_pattern is not None: 
+                probability_path = Path(postprocess.probability_pattern.format(id_=pid))
+            if postprocess.image_pattern is not None:
+                image_path = Path(postprocess.image_pattern.format(id_=pid))
+        rows.extend(evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics, 
+                                     postprocess=postprocess, save_folder=save_folder, 
+                                     probability_path=probability_path, image_path=image_path))  
 
     return rows
 
@@ -198,19 +219,24 @@ def build_postprocessing_pipeline(args: argparse.Namespace) -> Optional[Postproc
         return None
 
     configured = {}
-    if "anatomy_aware_filtering" in args.postprocessing:
+    configured_names = set(args.postprocessing) & set(CONFIGURED_POSTPROCESSORS)
+    if configured_names:
         try:
             with open(args.postprocessing_config) as config_file:
                 root_config = json.load(config_file)
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Cannot load post-processing config {args.postprocessing_config}: {error}") from error
-        configured = root_config.get("anatomy_aware_filtering")
+        configured = {name: root_config[name] for name in configured_names}
 
-    steps: list[tuple[Callable, bool]] = []
+    steps: list[tuple[Callable, Sequence[str]]] = []
     for method in args.postprocessing:
         if method == "anatomy_aware_filtering":
-            processor = partial(anatomy_aware_filtering, config=configured)
-            steps.append((processor, True))
+            processor = partial(anatomy_aware_filtering, config=configured[method])
+            steps.append((processor, ("spacing",)))
+            continue
+        if method == "dense_crf":
+            processor = partial(dense_crf, config=configured[method])
+            steps.append((processor, ("probabilities", "image", "spacing")))
             continue
 
         options = {"classes": args.postprocessing_classes}
@@ -222,9 +248,14 @@ def build_postprocessing_pipeline(args: argparse.Namespace) -> Optional[Postproc
             options["iterations"] = args.iterations
         if method == "salt_and_pepper":
             options["kernel_size"] = args.kernel_size
-        steps.append((partial(POSTPROCESSORS[method], **options), False))
+        steps.append((partial(POSTPROCESSORS[method], **options), ()))
 
-    return PostprocessingPipeline(steps)
+    dense_config = configured.get("dense_crf", {})
+    return PostprocessingPipeline(
+        steps,
+        probability_pattern=dense_config.get("probability_pattern"),
+        image_pattern=dense_config.get("image_pattern"),
+    )
 
 
 def main(args: argparse.Namespace) -> None:
@@ -270,7 +301,7 @@ def get_args() -> argparse.Namespace:
                         help="Ordered techniques applied in memory before scoring (default: none)")
     parser.add_argument("--postprocessing_config", type=Path,
                         default=Path(__file__).with_name("postprocessing_config.json"),
-                        help="JSON parameters for configured methods such as anatomy_aware_filtering")
+                        help="JSON inputs and parameters for anatomy_aware_filtering and dense_crf")
     parser.add_argument("--top_k", type=int, default=1,
                         help="Number of components per class for largest_connected_components only (default: 1).")
     parser.add_argument("--connectivity", type=int, choices=[6, 18, 26], default=None,
@@ -303,6 +334,8 @@ def get_args() -> argparse.Namespace:
         parser.error("--postprocessing none cannot be combined with another method")
     if len(args.postprocessing) != len(set(args.postprocessing)):
         parser.error("--postprocessing methods cannot be repeated")
+    if "dense_crf" in args.postprocessing and args.postprocessing[0] != "dense_crf":
+        parser.error("dense_crf must be the first post-processing method")
     if args.postprocessing == ["salt_and_pepper"] and args.connectivity is not None:
         parser.error("salt_and_pepper uses --kernel_size, not --connectivity")
     if args.save_folder is not None and not args.save:

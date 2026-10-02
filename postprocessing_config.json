@@ -31,5 +31,18 @@
         "always_keep_largest": true
       }
     }
+  },
+  "dense_crf": {
+    "probability_pattern": "results/segthor_seed43/exp_L6_balance_normalized/results/probability_volumes/{id_}.nii.gz",
+    "image_pattern": "data/segthor_part1/train/{id_}/{id_}.nii.gz",
+    "iterations": 5, 
+    "probability_epsilon": 1e-6,
+    "spatial_sigma_mm": [3.0,3.0, 3.0],
+    "spatial_weight": 3.0,
+    "bilateral_spatial_sigma_mm": [17.0 , 12.0, 10.0],
+    "bilateral_intensity_sigma_hu": 50.0,  
+    "bilateral_weight": 5.0,  
+    "roi_foreground_probability": 0.5,
+    "roi_margin_mm": 20.0   
   }
 }

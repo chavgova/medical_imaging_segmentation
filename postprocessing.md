@@ -1,10 +1,9 @@
 # Segmentation post-processing
 
 Post-processing refines predicted segmentation masks before evaluation by
-removing components, filling enclosed holes, or applying morphological opening
-and closing, denoising salt-and-pepper artifacts, or applying class-specific
-anatomical component rules. The functions operate on full 3D NumPy label maps,
-not individual slices or probability maps. Label `0` is background.
+removing components, filling enclosed holes, applying morphology, denoising
+salt-and-pepper artifacts, applying class-specific anatomical rules, or refining
+softmax boundaries with a 3D dense CRF. Label `0` is background.
 
 [`eval.py`](eval.py) loads compressed NIfTI files directly from a folder such as
 `volumes/segthor/ce`, with one `<patient_id>.nii.gz` per patient. Filtering runs
@@ -151,6 +150,53 @@ python eval.py \
     --postprocessing_config postprocessing_config.json \
     --dest results/segthor_seed43/exp_L6_balance_normalized/results/anatomy_aware.csv \
     --save --save_folder results/segthor_seed43/exp_L6_balance_normalized/results/anatomy_aware_volumes
+```
+
+### 3D dense CRF
+
+Implemented as `dense_crf(volume, probabilities, image, spacing, config)` in
+[`postprocessing.py`](postprocessing.py). Enable it with
+`--postprocessing dense_crf`. It uses the network's softmax probabilities as
+unary energies and adds two fully connected pairwise terms: a physical-distance
+Gaussian term for spatial consistency and a bilateral physical-distance/CT-HU
+term for alignment to image boundaries. Mean-field inference produces the final
+multiclass label map.
+
+The CRF is evaluated in a probability-defined foreground ROI plus a physical
+margin to keep 3D inference tractable. Spatial coordinates are expressed in mm,
+so anisotropic SegTHOR spacing is handled explicitly. The probability NIfTI must
+have shape `[X, Y, Z, classes]`; the CT, probabilities, prediction, and ground
+truth must already be on the same voxel grid. Dense CRF must be listed first;
+anatomy-aware filtering can follow it to remove implausible disconnected regions.
+
+All inputs and hyperparameters are under `dense_crf` in
+[`postprocessing_config.json`](postprocessing_config.json):
+
+| JSON setting | Meaning |
+|---|---|
+| `probability_pattern` | Class-last softmax NIfTI path containing `{id_}`. |
+| `image_pattern` | Original CT NIfTI path containing `{id_}`. |
+| `iterations` | Number of mean-field updates. |
+| `probability_epsilon` | Lower probability bound before `-log(p)`. |
+| `spatial_sigma_mm`, `spatial_weight` | Scale and strength of spatial smoothing. |
+| `bilateral_spatial_sigma_mm` | Physical scale of CT-aware smoothing. |
+| `bilateral_intensity_sigma_hu`, `bilateral_weight` | HU similarity scale and CT-aware term strength. |
+| `roi_foreground_probability`, `roi_margin_mm` | Total foreground-posterior ROI threshold and physical padding. |
+
+The supplied values are starting points and must be selected on validation data.
+The formulation follows [Krahenbuhl and Koltun's fully connected
+CRF](https://arxiv.org/abs/1210.5644) and its 3D medical-image extension by
+[Kamnitsas et al.](https://arxiv.org/abs/1603.05959). The implementation uses
+[PyDenseCRF's generic N-dimensional interface](https://github.com/lucasb-eyer/pydensecrf).
+
+```sh
+python eval.py \
+    --pred_folder results/segthor_seed43/exp_L6_balance_normalized/results/pred_volumes \
+    --gt_pattern 'results/segthor_seed43/exp_L6_balance_normalized/results/gt_volumes/{id_}.nii.gz' \
+    --num_classes 5 --postprocessing dense_crf \
+    --postprocessing_config postprocessing_config.json \
+    --dest results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf.csv \
+    --save --save_folder results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf_volumes
 ```
 
 ### Fill holes per class
