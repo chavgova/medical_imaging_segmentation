@@ -199,6 +199,26 @@ python eval.py \
     --save --save_folder results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf_volumes
 ```
 
+### Visualize post-processing changes
+
+The NIfTI mode in [`viewer/viewer.py`](viewer/viewer.py) shows the CT, original
+prediction, post-processed prediction, ground truth, and a change map. It starts
+on the axial slice changed most by post-processing and can save the same view as
+a PNG. The first two masks are treated as the before/after pair.
+
+```sh
+python viewer/viewer.py \
+    --volume_image data/segthor_part1/train/Patient_03/Patient_03.nii.gz \
+    --volume_masks \
+        results/segthor_seed43/exp_L6_balance_normalized/results/pred_volumes/Patient_03.nii.gz \
+        results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf_volumes/Patient_03.nii.gz \
+        results/segthor_seed43/exp_L6_balance_normalized/results/gt_volumes/Patient_03.nii.gz \
+    --display_names "Original" "Dense CRF" "Ground truth" \
+    -C 5 --cmap segthor --show_changes --legend \
+    --save results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf_comparison.png \
+    --headless
+```
+
 ### Fill holes per class
 
 Implemented as `fill_holes(volume, classes=None, connectivity=6)` in
