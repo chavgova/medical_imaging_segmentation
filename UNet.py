@@ -504,6 +504,9 @@ class UNet(nn.Module):
             # Pytorch-UNet with bilinear=True
             case "bilinear":
                 # No weights, so the channels stay the same (in == out).
+                assert (
+                    in_channels == out_channels
+                ), f"bilinear upsampling can't change {in_channels} into {out_channels} channels"
                 return nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
 
     def conv(self, in_channels: int, out_channels: int, stride: int = 1) -> nn.Conv2d:
