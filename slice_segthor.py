@@ -22,6 +22,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import json
 import pickle
 import random
 import argparse
@@ -37,7 +38,11 @@ from scipy import ndimage
 from skimage.io import imsave
 from skimage.transform import resize
 
-from utils import map_, tqdm_
+from utils import PREPROCESSING_FILE, map_, tqdm_, window_folder
+
+
+# Clip window of --clahe when no --hu_min/--hu_max is given (the original P2 setting)
+CLAHE_DEFAULT_WINDOW = (-1000.0, 300.0)
 
 
 def norm_arr(img: np.ndarray, hu_min=None, hu_max=None, use_clahe: bool = False) -> np.ndarray:
@@ -45,9 +50,9 @@ def norm_arr(img: np.ndarray, hu_min=None, hu_max=None, use_clahe: bool = False)
     if use_clahe:
         from skimage.exposure import equalize_adapthist
 
-        # Clip to a broad physiological range first so outliers (metal, scanner table)
+        # Clip to the HU window first so outliers (metal, scanner table)
         # don't skew the local histogram in whichever tile they land in.
-        clip_min, clip_max = -1000.0, 300.0
+        clip_min, clip_max = (hu_min, hu_max) if hu_min is not None else CLAHE_DEFAULT_WINDOW
         rescaled = (np.clip(casted, clip_min, clip_max) - clip_min) / (clip_max - clip_min)
 
         # 2D per axial slice: the network only ever sees one slice at a time, so there's
@@ -165,7 +170,8 @@ def split_merged_aorta_esophagus(gt: np.ndarray, r: int = 4) -> np.ndarray:
 
 def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int],
                   test_mode: bool = False, hu_min=None, hu_max=None, use_clahe: bool = False,
-                  target_spacing=None, fix_aorta_esophagus: bool = False) -> tuple[float, float, float]:
+                  target_spacing=None, fix_aorta_esophagus: bool = False,
+                  hu_windows: list[tuple[float, float]] | None = None) -> tuple[float, float, float]:
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
     ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
@@ -189,9 +195,13 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
     else:
         gt = np.zeros_like(ct, dtype=np.uint8)
 
-    norm_ct: np.ndarray = norm_arr(ct, hu_min, hu_max, use_clahe)
+    # One normalized volume per HU window; without --hu_windows there is just one
+    norm_cts: list[np.ndarray]
+    if hu_windows is not None:
+        norm_cts = [norm_arr(ct, lo, hi) for lo, hi in hu_windows]
+    else:
+        norm_cts = [norm_arr(ct, hu_min, hu_max, use_clahe)]
 
-    to_slice_ct = norm_ct
     to_slice_gt = gt
 
     # Baseline (target_spacing=None): resize straight to `shape`, ignoring native spacing,
@@ -204,20 +214,20 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
         resize_shape = shape
 
     for idz in range(z):
-        img_slice = resize_(to_slice_ct[:, :, idz], resize_shape).astype(np.uint8)
+        img_slices = [resize_(norm_ct[:, :, idz], resize_shape).astype(np.uint8) for norm_ct in norm_cts]
         gt_slice = resize_(to_slice_gt[:, :, idz], resize_shape, order=0).astype(np.uint8)
         if target_spacing is not None:
-            img_slice = center_crop_or_pad(img_slice, shape, pad_value=0)
+            img_slices = [center_crop_or_pad(img_slice, shape, pad_value=0) for img_slice in img_slices]
             gt_slice = center_crop_or_pad(gt_slice, shape, pad_value=0)
-        assert img_slice.shape == gt_slice.shape
+        assert all(img_slice.shape == gt_slice.shape for img_slice in img_slices)
         gt_slice *= 63
         assert gt_slice.dtype == np.uint8, gt_slice.dtype
         # assert set(np.unique(gt_slice)) <= set(range(5))
         assert set(np.unique(gt_slice)) <= set([0, 63, 126, 189, 252]), np.unique(gt_slice)
 
-        arrays: list[np.ndarray] = [img_slice, gt_slice]
+        arrays: list[np.ndarray] = [*img_slices, gt_slice]
 
-        subfolders: list[str] = ["img", "gt"]
+        subfolders: list[str] = [window_folder(w) for w in range(len(img_slices))] + ["gt"]
         assert len(arrays) == len(subfolders)
         for save_subfolder, data in zip(subfolders,
                                         arrays):
@@ -288,7 +298,8 @@ def main(args: argparse.Namespace):
                                  hu_max=args.hu_max,
                                  use_clahe=args.clahe,
                                  target_spacing=args.target_spacing,
-                                 fix_aorta_esophagus=args.fix_aorta_esophagus)
+                                 fix_aorta_esophagus=args.fix_aorta_esophagus,
+                                 hu_windows=args.hu_windows)
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
         match args.process:
@@ -306,6 +317,39 @@ def main(args: argparse.Namespace):
         pickle.dump(resolution_dict, f, pickle.HIGHEST_PROTOCOL)
         print(f"Saved spacing dictionnary to {f}")
 
+    # main.py reads this to know the number of input channels
+    with open(dest_path / PREPROCESSING_FILE, 'w') as f:
+        json.dump(preprocessing_config(args), f, indent=2)
+
+
+def preprocessing_config(args: argparse.Namespace) -> dict:
+    """Normalization method and its HU windows, in the order of the image folders."""
+    if args.hu_windows is not None:
+        return {"method": "multiwindow", "windows": [list(w) for w in args.hu_windows]}
+    if args.clahe:
+        window = (args.hu_min, args.hu_max) if args.hu_min is not None else CLAHE_DEFAULT_WINDOW
+        return {"method": "clahe", "windows": [list(window)]}
+    if args.hu_min is not None:
+        return {"method": "hu", "windows": [[args.hu_min, args.hu_max]]}
+    return {"method": "minmax", "windows": []}
+
+
+def parse_hu_windows(parser: argparse.ArgumentParser,
+                     args: argparse.Namespace) -> list[tuple[float, float]] | None:
+    """Turns the flat --hu_windows values into (lo, hi) pairs, and checks them.
+    Shared with main.py, which forwards the flag for --test_pipeline."""
+    if args.hu_windows is None:
+        return None
+    values = args.hu_windows
+    if len(values) < 4 or len(values) % 2 != 0:
+        parser.error('--hu_windows needs at least two LO HI pairs')
+    windows = list(zip(values[::2], values[1::2]))
+    if not all(np.isfinite(lo) and np.isfinite(hi) and lo < hi for lo, hi in windows):
+        parser.error('--hu_windows bounds must be finite, with LO < HI in every pair')
+    if args.hu_min is not None or args.clahe:
+        parser.error('--hu_windows is mutually exclusive with --hu_min/--hu_max and --clahe')
+    return windows
+
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Slicing parameters')
@@ -316,9 +360,15 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('--hu_min', type=float, default=None, help='HU window lower bound; requires --hu_max.')
     parser.add_argument('--hu_max', type=float, default=None, help='HU window upper bound; requires --hu_min.')
     parser.add_argument('--clahe', action='store_true',
-                        help='Clip to [-1000, 300] HU then apply CLAHE (2D per-slice) instead of '
-                             'linear normalization. Mutually exclusive with --hu_min/--hu_max. '
+                        help='Clip to the --hu_min/--hu_max window (default [-1000, 300] HU) then '
+                             'apply CLAHE (2D per-slice) instead of linear normalization. '
                              'Default: off.')
+    parser.add_argument('--hu_windows', type=float, nargs='+', default=None,
+                        metavar='LO HI',
+                        help='Several HU windows as LO HI pairs, e.g. -1000 300 -300 300. Each '
+                             'window is saved as its own image (img/, img_w1/, ...) and becomes '
+                             'its own input channel. Mutually exclusive with --hu_min/--hu_max '
+                             'and --clahe.')
     parser.add_argument('--target_spacing', type=float, default=None,
                         help='Resample in-plane to this physical spacing (mm/pixel) before '
                              'center-crop/pad to --shape. Default: no resampling (baseline), '
@@ -340,8 +390,7 @@ def get_args() -> argparse.Namespace:
     if args.hu_min is not None and not (np.isfinite(args.hu_min) and np.isfinite(args.hu_max)
                                         and args.hu_min < args.hu_max):
         parser.error('HU bounds must be finite, with --hu_min < --hu_max')
-    if args.clahe and args.hu_min is not None:
-        parser.error('--clahe and --hu_min/--hu_max are mutually exclusive normalization choices')
+    args.hu_windows = parse_hu_windows(parser, args)
     if args.target_spacing is not None and not (np.isfinite(args.target_spacing)
                                                  and args.target_spacing > 0):
         parser.error('--target_spacing must be a finite positive number')
