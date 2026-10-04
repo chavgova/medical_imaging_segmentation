@@ -355,6 +355,40 @@ def slice_patient(
     return dx, dy, dz
 
 
+def compute_percentile_window(
+    training_ids: list[str], src_path: Path,
+    fix_aorta_esophagus: bool = False,
+    lo_pct: float = 0.5, hi_pct: float = 99.5,
+) -> tuple[float, float]:
+    """Data-driven HU clip window: the [lo_pct, hi_pct] percentile of raw HU
+    values at every voxel labeled as a foreground organ, pooled across the
+    training set, instead of a hand-picked radiology window. Computed once
+    from the training split only, then applied unchanged to every image
+    (train and val) -- see get_args --hu_percentile.
+
+    This pipeline quantizes normalized images to 8-bit PNGs and divides by
+    255 on load, so clip-then-z-score-then-rescale-to-[0,255] works out to
+    the exact same formula as clip-then-linear-rescale-to-[0,255] (the
+    z-score's own scale/offset cancels out in that final rescale). So the
+    part of this that actually matters here is the window itself -- this
+    returns (lo, hi) to be used exactly like --hu_min/--hu_max.
+    """
+    values = []
+    for id_ in tqdm_(training_ids):
+        ct = np.asarray(
+            nib.load(str(src_path / "train" / id_ / f"{id_}.nii.gz")).dataobj
+        )
+        gt = np.asarray(
+            nib.load(str(src_path / "train" / id_ / "GT.nii.gz")).dataobj
+        )
+        if fix_aorta_esophagus:
+            gt = split_merged_aorta_esophagus(gt)
+        values.append(ct[gt > 0].astype(np.float64))
+    pooled = np.concatenate(values)
+    lo, hi = np.percentile(pooled, [lo_pct, hi_pct])
+    return float(lo), float(hi)
+
+
 def get_splits(
     src_path: Path, retains: int, fold: int
 ) -> tuple[list[str], list[str], list[str]]:
@@ -402,6 +436,13 @@ def main(args: argparse.Namespace):
         training_ids, validation_ids, test_ids = get_splits(
             src_path, args.retains, args.fold
         )
+
+    if args.hu_percentile:
+        print("Computing a data-driven HU window from the training set's labeled voxels...")
+        args.hu_min, args.hu_max = compute_percentile_window(
+            training_ids, src_path, args.fix_aorta_esophagus
+        )
+        print(f"  --hu_percentile window: [{args.hu_min:.1f}, {args.hu_max:.1f}]")
 
     resolution_dict: dict[str, tuple[float, float, float]] = {}
 
@@ -457,6 +498,8 @@ def preprocessing_config(args: argparse.Namespace) -> dict:
             else CLAHE_DEFAULT_WINDOW
         )
         return {"method": "clahe", "windows": [list(window)]}
+    if args.hu_percentile:
+        return {"method": "hu_percentile", "windows": [[args.hu_min, args.hu_max]]}
     if args.hu_min is not None:
         return {"method": "hu", "windows": [[args.hu_min, args.hu_max]]}
     return {"method": "minmax", "windows": []}
@@ -519,6 +562,16 @@ def get_args() -> argparse.Namespace:
         "and --clahe.",
     )
     parser.add_argument(
+        "--hu_percentile",
+        action="store_true",
+        help="Auto-compute the HU clip window from the training set instead of "
+        "a hand-picked one: the [0.5, 99.5] percentile of HU values at voxels "
+        "labeled as a foreground organ, pooled across all training patients, "
+        "then used exactly like --hu_min/--hu_max. Mutually exclusive with "
+        "--hu_min/--hu_max, --clahe, and --hu_windows. Default: off. See "
+        "compute_percentile_window().",
+    )
+    parser.add_argument(
         "--target_spacing",
         type=float,
         default=None,
@@ -571,6 +624,13 @@ def get_args() -> argparse.Namespace:
     ):
         parser.error("HU bounds must be finite, with --hu_min < --hu_max")
     args.hu_windows = parse_hu_windows(parser, args)
+    if args.hu_percentile and (
+        args.hu_min is not None or args.clahe or args.hu_windows is not None
+    ):
+        parser.error(
+            "--hu_percentile is mutually exclusive with --hu_min/--hu_max, "
+            "--clahe, and --hu_windows"
+        )
     if args.target_spacing is not None and not (
         np.isfinite(args.target_spacing) and args.target_spacing > 0
     ):

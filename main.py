@@ -280,7 +280,9 @@ def read_preprocessing(
     n_windows = len(windows) if preprocessing["method"] == "multiwindow" else 1
     # min-max and CLAHE don't keep a linear HU mapping
     hu_window = (
-        tuple(windows[0]) if preprocessing["method"] in ("hu", "multiwindow") else None
+        tuple(windows[0])
+        if preprocessing["method"] in ("hu", "hu_percentile", "multiwindow")
+        else None
     )
     return n_windows, hu_window
 
@@ -632,6 +634,7 @@ def ensure_smoke_data(
     fix_aorta_esophagus=False,
     crop_body=False,
     hu_windows=None,
+    hu_percentile=False,
 ):
     """Create smoke data only if its directory does not exist."""
     if data_dir.exists():
@@ -656,6 +659,8 @@ def ensure_smoke_data(
         command += ["--hu_windows"] + [
             str(bound) for window in hu_windows for bound in window
         ]
+    if hu_percentile:
+        command += ["--hu_percentile"]
     if target_spacing is not None:
         command += ["--target_spacing", str(target_spacing)]
     if fix_aorta_esophagus:
@@ -770,6 +775,13 @@ def main():
         action="store_true",
         help="Smoke preprocessing: crop to the body bounding box before resizing. "
         "Default off; requires a fresh --data_dir, same as --hu_min/--hu_max.",
+    )
+    parser.add_argument(
+        "--hu_percentile",
+        action="store_true",
+        help="Smoke preprocessing: auto-compute the HU window from the training "
+        "set instead of a hand-picked one. Mutually exclusive with "
+        "--hu_min/--hu_max, --clahe, and --hu_windows; requires a fresh --data_dir.",
     )
     parser.add_argument("--mode", default="full", choices=["partial", "full"])
     parser.add_argument(
@@ -959,6 +971,13 @@ def main():
     ):
         parser.error("HU bounds must be finite, with --hu_min < --hu_max")
     args.hu_windows = parse_hu_windows(parser, args)
+    if args.hu_percentile and (
+        args.hu_min is not None or args.clahe or args.hu_windows is not None
+    ):
+        parser.error(
+            "--hu_percentile is mutually exclusive with --hu_min/--hu_max, "
+            "--clahe, and --hu_windows"
+        )
     if args.dataset is None:
         args.dataset = "SEGTHOR" if args.test_pipeline else "TOY2"
     if args.model is None:
@@ -1005,6 +1024,7 @@ def main():
                 args.fix_aorta_esophagus,
                 args.crop_body,
                 args.hu_windows,
+                args.hu_percentile,
             )
 
     if args.deterministic:

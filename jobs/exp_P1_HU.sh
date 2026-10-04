@@ -33,7 +33,12 @@ export MPLBACKEND=Agg
 case "$STAGE" in
     prepare)
         mkdir -p "$LOG_DIR"
-        if [ ! -d "$DATA_DIR" ]; then
+        # preprocessing.json is only written after slicing finishes successfully,
+        # so this also catches (and re-slices from scratch) a directory left
+        # behind by a crashed or timed-out previous attempt -- a plain
+        # directory-existence check would silently treat that partial data as done.
+        if [ ! -f "$DATA_DIR/preprocessing.json" ]; then
+            rm -rf "$DATA_DIR"
             python slice_segthor.py --source_dir "$SOURCE_DIR" --dest_dir "$DATA_DIR" \
                 --shape 256 256 --retains 5 --seed 43 --fold 0 \
                 --hu_min -1000 --hu_max 300 \
