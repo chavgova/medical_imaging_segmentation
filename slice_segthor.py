@@ -296,7 +296,6 @@ def slice_patient(
         gt = gt[row_sl, col_sl]
         x, y = ct.shape[0], ct.shape[1]
 
-    norm_ct: np.ndarray = norm_arr(ct, hu_min, hu_max, use_clahe)
     # One normalized volume per HU window; without --hu_windows there is just one
     norm_cts: list[np.ndarray]
     if hu_windows is not None:
