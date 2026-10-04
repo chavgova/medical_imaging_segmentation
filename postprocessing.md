@@ -144,12 +144,12 @@ the validation-selected approach described by Isensee et al. in
 
 ```sh
 python eval.py \
-    --pred_folder results/segthor_seed43/exp_L6_balance_normalized/results/pred_volumes \
-    --gt_pattern 'results/segthor_seed43/exp_L6_balance_normalized/results/gt_volumes/{id_}.nii.gz' \
+    --pred_folder results/exp_L6_balance_normalized/results/pred_volumes \
+    --gt_pattern 'results/exp_L6_balance_normalized/results/gt_volumes/{id_}.nii.gz' \
     --num_classes 5 --postprocessing anatomy_aware_filtering \
     --postprocessing_config postprocessing_config.json \
-    --dest results/segthor_seed43/exp_L6_balance_normalized/results/anatomy_aware.csv \
-    --save --save_folder results/segthor_seed43/exp_L6_balance_normalized/results/anatomy_aware_volumes
+    --dest results/exp_L6_balance_normalized/results/anatomy_aware.csv \
+    --save --save_folder results/exp_L6_balance_normalized/results/anatomy_aware_volumes
 ```
 
 ### 3D dense CRF
@@ -189,14 +189,30 @@ CRF](https://arxiv.org/abs/1210.5644) and its 3D medical-image extension by
 [Kamnitsas et al.](https://arxiv.org/abs/1603.05959). The implementation uses
 [PyDenseCRF's generic N-dimensional interface](https://github.com/lucasb-eyer/pydensecrf).
 
+Dense CRF needs class probabilities, not only the hard labels in
+`pred_volumes`. For a completed run containing `bestweights.pt` and
+`config.json`, ypu can export them once without retraining:
+
+```sh
+python export_probabilities.py \
+    --result_dir results/exp_L6_balance_normalized/results \
+    --postprocessing_config postprocessing_config.json --gpu
+```
+
+The exporter restores the saved model and validation preprocessing, reruns
+validation inference, and writes class-last `[X, Y, Z, classes]` nifti files to
+the `probability_pattern` configured in `postprocessing_config.json`. If the
+saved `data_dir` is no longer valid, supply its current location with
+`--data_dir data/exp_P1_HU`.
+
 ```sh
 python eval.py \
-    --pred_folder results/segthor_seed43/exp_L6_balance_normalized/results/pred_volumes \
-    --gt_pattern 'results/segthor_seed43/exp_L6_balance_normalized/results/gt_volumes/{id_}.nii.gz' \
+    --pred_folder results/exp_L6_balance_normalized/results/pred_volumes \
+    --gt_pattern 'results/exp_L6_balance_normalized/results/gt_volumes/{id_}.nii.gz' \
     --num_classes 5 --postprocessing dense_crf \
     --postprocessing_config postprocessing_config.json \
-    --dest results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf.csv \
-    --save --save_folder results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf_volumes
+    --dest results/exp_L6_balance_normalized/results/dense_crf.csv \
+    --save --save_folder results/exp_L6_balance_normalized/results/dense_crf_volumes
 ```
 
 ### Visualize post-processing changes
@@ -210,12 +226,12 @@ a PNG. The first two masks are treated as the before/after pair.
 python viewer/viewer.py \
     --volume_image data/segthor_part1/train/Patient_03/Patient_03.nii.gz \
     --volume_masks \
-        results/segthor_seed43/exp_L6_balance_normalized/results/pred_volumes/Patient_03.nii.gz \
-        results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf_volumes/Patient_03.nii.gz \
-        results/segthor_seed43/exp_L6_balance_normalized/results/gt_volumes/Patient_03.nii.gz \
+        results/exp_L6_balance_normalized/results/pred_volumes/Patient_03.nii.gz \
+        results/exp_L6_balance_normalized/results/dense_crf_volumes/Patient_03.nii.gz \
+        results/exp_L6_balance_normalized/results/gt_volumes/Patient_03.nii.gz \
     --display_names "Original" "Dense CRF" "Ground truth" \
     -C 5 --cmap segthor --show_changes --legend \
-    --save results/segthor_seed43/exp_L6_balance_normalized/results/dense_crf_comparison.png \
+    --save results/exp_L6_balance_normalized/results/dense_crf_comparison.png \
     --headless
 ```
 

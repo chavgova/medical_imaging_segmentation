@@ -33,7 +33,7 @@
     }
   },
   "dense_crf": {
-    "probability_pattern": "results/segthor_seed43/exp_L6_balance_normalized/results/probability_volumes/{id_}.nii.gz",
+    "probability_pattern": "results/exp_L6_balance_normalized/results/probability_volumes/{id_}.nii.gz",
     "image_pattern": "data/segthor_part1/train/{id_}/{id_}.nii.gz",
     "iterations": 5, 
     "probability_epsilon": 1e-6,
