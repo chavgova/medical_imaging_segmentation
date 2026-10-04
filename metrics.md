@@ -98,11 +98,18 @@ absent from both volumes, `float("nan")` when it's present in only one.
 
 ## Implementation notes
 
-`hausdorff_distance_95` and `average_surface_distance` share the same
-surface-extraction approach: binary erosion (`scipy.ndimage.binary_erosion`)
-to find each mask's boundary voxels, then `scipy.ndimage.distance_transform_edt`
-with `sampling=spacing` to get physically-scaled nearest-boundary distances in
-each direction.
+`hausdorff_distance_95` and `average_surface_distance` delegate the distance
+computation to [MONAI](https://docs.monai.io/en/stable/metrics.html):
+`monai.metrics.compute_hausdorff_distance(percentile=95, directed=False)` and
+`monai.metrics.compute_average_surface_distance(symmetric=True)`, with
+`spacing` passed through so distances are in mm. MONAI finds each mask's
+boundary voxels by binary erosion, then computes exact Euclidean
+nearest-boundary distances in each direction (a KD-tree on CPU; cuCIM's GPU
+distance transform for CUDA tensors when cuCIM is installed).
+
+The empty-mask rules above (`0.0` / `NaN`) are applied by our wrappers before
+MONAI is called; MONAI on its own would return `NaN` when both masks are empty
+and `NaN`/`inf` when only one is.
 
 ## eval.py
 
