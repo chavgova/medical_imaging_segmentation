@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=exp_P2_CLAHE_prep
+#SBATCH --job-name=exp_P2_CLAHE_310_400_prep
 #SBATCH --partition=rome
 #SBATCH --cpus-per-task=16
 #SBATCH --time=02:00:00
@@ -11,8 +11,8 @@ set -euo pipefail
 STAGE="${1:-prepare}"
 REPO="$HOME/ai4mi_project"
 SCRIPT="$REPO/jobs/exp_P2_CLAHE.sh"
-DATA_DIR="$REPO/data/segthor_seed43/exp_P2_CLAHE"
-EXPERIMENT_DIR="$REPO/results/segthor_seed43/exp_P2_CLAHE"
+DATA_DIR="$REPO/data/segthor_seed43/exp_P2_CLAHE_310_400"
+EXPERIMENT_DIR="$REPO/results/segthor_seed43/exp_P2_CLAHE_310_400"
 RESULT_DIR="$EXPERIMENT_DIR/results"
 LOG_DIR="$EXPERIMENT_DIR/logs"
 SOURCE_DIR="$REPO/data/segthor_part1"
@@ -36,10 +36,10 @@ case "$STAGE" in
         if [ ! -d "$DATA_DIR" ]; then
             python slice_segthor.py --source_dir "$SOURCE_DIR" --dest_dir "$DATA_DIR" \
                 --shape 256 256 --retains 5 --seed 43 --fold 0 \
-                --fix_aorta_esophagus --clahe \
+                --clahe --hu_min -310 --hu_max 400 \
                 --process "$SLURM_CPUS_PER_TASK"
         fi
-        sbatch --job-name=exp_P2_CLAHE_train --partition=gpu_a100 --gpus=1 \
+        sbatch --job-name=exp_P2_CLAHE_310_400_train --partition=gpu_a100 --gpus=1 \
             --cpus-per-task=18 --time=04:00:00 --account=gpuuva084 \
             --output="$LOG_DIR/slurm_train_%j.out" "$SCRIPT" train
         ;;
@@ -48,7 +48,7 @@ case "$STAGE" in
             --data_dir "$DATA_DIR" --dest "$RESULT_DIR" --gpu \
             --loss_fn ce --opt adam --lr 0.0005 --context_slices 0 \
             --scheduler none --deterministic --seed 43
-        sbatch --job-name=exp_P2_CLAHE_eval --partition=rome --cpus-per-task=16 \
+        sbatch --job-name=exp_P2_CLAHE_310_400_eval --partition=rome --cpus-per-task=16 \
             --time=01:00:00 --account=gpuuva084 \
             --output="$LOG_DIR/slurm_eval_%j.out" "$SCRIPT" evaluate
         ;;
