@@ -33,7 +33,8 @@ export MPLBACKEND=Agg
 case "$STAGE" in
     prepare)
         mkdir -p "$LOG_DIR"
-        if [ ! -d "$DATA_DIR" ]; then
+        if [ ! -f "$DATA_DIR/preprocessing.json" ]; then
+            rm -rf "$DATA_DIR"
             python slice_segthor.py --source_dir "$SOURCE_DIR" --dest_dir "$DATA_DIR" \
                 --shape 256 256 --retains 5 --seed 43 --fold 0 \
                 --clahe --hu_min -310 --hu_max 400 \
