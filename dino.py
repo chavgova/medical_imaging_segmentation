@@ -111,8 +111,8 @@ class FrozenDino(nn.Module):
             not self.training and not self.model.training
         ), "FrozenDino must stay in eval mode"
         assert (
-            x.dim() == 4 and x.size(1) % 2 == 1
-        ), f"expected (B, 2 * context_slices + 1, H, W), got {tuple(x.shape)}"
+            x.dim() == 4 and x.size(1) == (2 * self.context_slices + 1) * self.n_windows
+        ), f"expected (B, (2 * context_slices + 1) * n_windows, H, W), got {tuple(x.shape)}"
         batch, _, height, width = x.shape
         assert (
             height % self.patch_size == 0 and width % self.patch_size == 0
@@ -121,7 +121,7 @@ class FrozenDino(nn.Module):
             x.min() >= 0 and x.max() <= 1
         ), "expected images scaled to [0, 1] (our PNGs divided by 255)"
         grid = (height // self.patch_size, width // self.patch_size)
-        center = x.size(1) // 2  # the middle slice with --context_slices
+        center = self.context_slices  # the middle slice of window 0
         image = x[:, center : center + 1]
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
             match self.dino:
@@ -140,7 +140,9 @@ class FrozenDino(nn.Module):
                 # The normalize() of MedDINOv3's inference/demo.ipynb: HU clamped
                 # to [-1000, 1000], then (HU - mean) / std, repeated to 3 channels
                 case "meddinov3-vitb16":
-                    hu = (HU_MIN + (HU_MAX - HU_MIN) * image).clamp(-1000, 1000)
+                    assert self.hu_window is not None
+                    hu_min, hu_max = self.hu_window
+                    hu = (hu_min + (hu_max - hu_min) * image).clamp(-1000, 1000)
                     rgb = ((hu - 65.1084213256836) / 178.01663208007812).expand(
                         -1, 3, -1, -1
                     )
