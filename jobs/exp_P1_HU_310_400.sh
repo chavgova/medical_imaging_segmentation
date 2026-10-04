@@ -36,7 +36,7 @@ case "$STAGE" in
         if [ ! -d "$DATA_DIR" ]; then
             python slice_segthor.py --source_dir "$SOURCE_DIR" --dest_dir "$DATA_DIR" \
                 --shape 256 256 --retains 5 --seed 43 --fold 0 \
-                --fix_aorta_esophagus --hu_min -310 --hu_max 400 \
+                --hu_min -310 --hu_max 400 \
                 --process "$SLURM_CPUS_PER_TASK"
         fi
         sbatch --job-name=exp_P1_HU_310_400_train --partition=gpu_a100 --gpus=1 \
