@@ -13,6 +13,9 @@ from metrics import dice, hausdorff_distance_95, average_surface_distance
 
 BACKGROUND_CLASS = 0
 
+# SegTHOR label convention: class index -> organ name
+SEGTHOR_CLASS_NAMES = ["background", "esophagus", "heart", "trachea", "aorta"]
+
 # such that all metrics have same signature: (pred, gt, spacing, c)
 def _dice_c(pred: np.ndarray, gt: np.ndarray, spacing, c: int = 1) -> float:
     return float(dice(pred, gt, classes=[c])[0])
@@ -53,7 +56,13 @@ def discover_classes(gt_paths: Sequence[Path]) -> list[int]:
     return sorted(classes)
 
 
-def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: Sequence[int], metrics: Sequence[str] = None) -> list[dict]:
+def class_name(c: int, class_names: Sequence[str]) -> str:
+    # Fall back to the class index for labels without a name.
+    return class_names[c] if c < len(class_names) else str(c)
+
+
+def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: Sequence[int], metrics: Sequence[str] = None,
+                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES) -> list[dict]:
 
     pred_vol = load_volume(pred_path)
     gt_vol = load_volume(gt_path)
@@ -72,7 +81,7 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
     for c in classes:
         if c == BACKGROUND_CLASS:
             continue
-        row = {"patient_id": patient_id, "class": c}
+        row = {"patient_id": patient_id, "class": c, "organ": class_name(c, class_names)}
         for metric in metrics:
             row[metric] = METRIC_FUNCS[metric](pred_vol, gt_vol, spacing, c=c)
         rows.append(row)
@@ -81,7 +90,8 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
 
 
 
-def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[int] = None, metrics: Sequence[str] = None) -> list[dict]:
+def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[int] = None, metrics: Sequence[str] = None,
+                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES) -> list[dict]:
 
     patient_ids = match_patients(pred_folder, gt_pattern)
 
@@ -95,7 +105,7 @@ def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[i
     for pid in tqdm_(patient_ids):
         pred_path = pred_folder / f"{pid}.nii.gz"
         gt_path = Path(gt_pattern.format(id_=pid))
-        rows.extend(evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics))
+        rows.extend(evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics, class_names=class_names))
 
     return rows
 
@@ -110,7 +120,8 @@ def summarize(rows: Sequence[dict], metrics: Sequence[str]) -> list[dict]:
         values = {name: np.array([row[name] for row in rows if row["class"] == c], dtype=np.float64)
                   for name in metric_names}
 
-        summary_row = {"class": c}
+        organ = next(row["organ"] for row in rows if row["class"] == c)
+        summary_row = {"class": c, "organ": organ}
         for name in metric_names:
             summary_row[f"{name}_mean"] = float(np.nanmean(values[name]))
             summary_row[f"{name}_std"] = float(np.nanstd(values[name]))
@@ -132,13 +143,13 @@ def save_csv(rows: Sequence[dict], path: Path) -> None:
 
 def print_summary(summary: Sequence[dict], metrics: Sequence[str]) -> None:
     for row in summary:
-        print(f"Class {row['class']}: ")
+        print(f"{row['organ']} (class {row['class']}): ")
         for metric in metrics:
             print(f"  {metric}: {row[f'{metric}_mean']:.4f} +/- {row[f'{metric}_std']:.4f}")
 
 
 def main(args: argparse.Namespace) -> None:
-    rows = evaluate_dataset(args.pred_folder, args.gt_pattern, args.num_classes, args.metrics)
+    rows = evaluate_dataset(args.pred_folder, args.gt_pattern, args.num_classes, args.metrics, args.class_names)
 
     dest: Path = args.dest
     summary_dest = dest.with_name(f"{dest.stem}_summary{dest.suffix}")
@@ -169,6 +180,10 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--num_classes", type=int, default=None,
                         help="Total number of classes, including background. "
                              "If omitted, inferred from the ground-truth volumes.")
+    parser.add_argument("--class_names", type=str, nargs="+", default=SEGTHOR_CLASS_NAMES,
+                        help="Organ name for each class index, starting with background (same convention "
+                             "as viewer.py). Defaults to the SegTHOR labels: "
+                             + " ".join(SEGTHOR_CLASS_NAMES) + ".")
     parser.add_argument("--dest", type=Path, required=True,
                         help="Output path for the per-patient-per-class results CSV. "
                              "The per-class summary is saved alongside it as <dest>_summary.csv")
