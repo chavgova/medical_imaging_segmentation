@@ -45,6 +45,24 @@ tqdm_ = partial(tqdm, dynamic_ncols=True,
                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{rate_fmt}{postfix}]')
 
 
+# Preprocessing metadata, written by slice_segthor.py next to train/ and val/
+PREPROCESSING_FILE = "preprocessing.json"
+
+
+def window_folder(w: int) -> str:
+    """Image folder of HU window w: the first window keeps the usual img/ folder."""
+    return "img" if w == 0 else f"img_w{w}"
+
+
+def load_preprocessing(data_dir: Path) -> dict | None:
+    """The preprocessing.json of a sliced dataset, or None for data sliced before it existed."""
+    path = Path(data_dir) / PREPROCESSING_FILE
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 class Dcm(AbstractContextManager):
     # Dummy Context manager
     def __exit__(self, *args, **kwargs):

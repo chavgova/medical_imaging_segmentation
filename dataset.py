@@ -38,6 +38,8 @@ import torch
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
+from utils import window_folder
+
 def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
     assert subset in ['train', 'val', 'test']
 
@@ -83,7 +85,7 @@ def _drop_empty_gt_slices(files: list[tuple[Path, Path | None]],
 class SliceDataset(Dataset):
     def __init__(self, subset, root_dir, img_transform=None,
              gt_transform=None, augment=False, equalize=False, debug=False,
-             context_slices: int = 0, drop_empty_slices: float = 0.0):
+             context_slices: int = 0, drop_empty_slices: float = 0.0, n_windows: int = 1):
 
         self.root_dir: str = root_dir
         self.img_transform: Callable | None = img_transform
@@ -92,6 +94,9 @@ class SliceDataset(Dataset):
         self.equalize: bool = equalize
         self.context_slices: int = context_slices
         assert self.context_slices >= 0
+        # HU windows from slice_segthor.py --hu_windows, each in its own image folder
+        self.n_windows: int = n_windows
+        assert self.n_windows >= 1
 
         self.test_mode: bool = subset == 'test'
 
@@ -145,10 +150,12 @@ class SliceDataset(Dataset):
         # We don't need a check on whether we do 2.5D
         # No 2.5D is just a special case with context_slices=0
         offsets = range(-self.context_slices, self.context_slices + 1)
+        neighbor_paths = [self._neighbor_img_path(img_path, offset) for offset in offsets]
         neighbor_imgs = []
-        for offset in offsets:
-            with Image.open(self._neighbor_img_path(img_path, offset)) as im:
-                neighbor_imgs.append(self.img_transform(im.copy()))
+        for w in range(self.n_windows):
+            for path in neighbor_paths:
+                with Image.open(path.parent.parent / window_folder(w) / path.name) as im:
+                    neighbor_imgs.append(self.img_transform(im.copy()))
         img: Tensor = torch.cat(neighbor_imgs, dim=0)
 
         if self.augmentation and torch.rand(()).item() < 0.5:

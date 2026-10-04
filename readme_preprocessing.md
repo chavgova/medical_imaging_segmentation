@@ -40,7 +40,7 @@ look before trusting it blindly on every patient.
 
 # Preprocessing
 ## Added flags: `--hu_min` and `--hu_max` 
-### For this dataset use -1000, 300. Verify in preprocessing_params.ipynb.
+### The original P1 used -1000, 300; updated narrow window -310, 400 (`jobs/exp_P1_HU_310_400.sh`.
 
 Supply both flags to enable HU windowing. Without them, the original per-volume
 Min-Max normalization stays unchanged. Bounds must be finite and `hu_min < hu_max`.
@@ -58,9 +58,9 @@ by 255 and quantized, then divided by 255 by the training loader. Masks are unch
 For example, test the `[-1000, 300]` candidate window in one command:
 
 ```bash
-python main.py --test_pipeline --hu_min -1000 --hu_max 300 \
-  --data_dir data/SEGTHOR_smoke_hu_m1000_300 \
-  --dest results/segthor/smoke_hu_1000_300
+python main.py --test_pipeline --hu_min 310 --hu_max 400 \
+  --data_dir data/SEGTHOR_smoke_hu_m310_400 \
+  --dest results/segthor/smoke_hu_300_00
 ```
 
 Use a fresh `--data_dir` when changing bounds: the simple smoke cache checks only
@@ -69,15 +69,49 @@ The notebook compares candidate windows; these example bounds are not automatic 
 
 ## Added flag: `--clahe`
 
-Alternative to `--hu_min`/`--hu_max`. Clips to `[-1000, 300]` HU, then applies
+Alternative to the linear rescale. Clips to the `--hu_min`/`--hu_max` window, then applies
 CLAHE (local adaptive contrast equalization) per slice instead of a single
 global rescale — can bring out soft-tissue edges that a linear rescale
-flattens out. Mutually exclusive with `--hu_min`/`--hu_max`. Off by default.
+flattens out. Without `--hu_min`/`--hu_max` it clips to `[-1000, 300]` HU, the setting
+of the original P2. Off by default.
 
 ```bash
 python slice_segthor.py --source_dir data/segthor_part1 --dest_dir data/SEGTHOR_clahe \
-  --shape 256 256 --clahe --retains 5
+  --shape 256 256 --clahe --hu_min -310 --hu_max 400 --retains 5
 ```
+
+## Added flag: `--hu_windows`
+
+Gives the network several HU windows of the same slice as separate input channels, so
+it can use a narrow soft-tissue window for the heart, aorta and esophagus and a wide one
+for the air around the trachea and lungs. Pass `LO HI` pairs, at least two:
+
+```bash
+python slice_segthor.py --source_dir data/segthor_part1 --dest_dir data/SEGTHOR_multiwindow \
+  --shape 256 256 --hu_windows -1000 300 -310 400 --retains 5
+```
+
+Each window is normalized like `--hu_min`/`--hu_max` and saved as its own grayscale PNG:
+the first window in `img/`, the others in `img_w1/`, `img_w2/`, ... with the same file
+names. Put the wide window first: `img/` is then identical to the `[-1000, 300]` data, so
+the viewer and DINO (which only looks at `img/`) see the same images as before. Same for `--hu_min`/`--hu_max` and `--clahe`.
+
+`SliceDataset` stacks the channels the `2 * context_slices + 1` slices of
+window 0, then those of window 1, so `main.py` builds the network with
+`(2 * context_slices + 1) * n_windows` input channels. Rotation augmentation uses the
+same angle for every channel; the Gaussian noise is drawn independently per channel.
+
+ENet only accepts fewer than 8 input channels so two windows work with `--context_slices` 0 or
+1 but not 2. Just use a different model for this.
+
+## `preprocessing.json`
+
+`slice_segthor.py` writes the normalization method and its HU windows next to `train/`
+and `val/`, e.g. `{"method": "multiwindow", "windows": [[-1000, 300], [-310, 400]]}`.
+`main.py` reads it for the number of input channels and copies it into `config.json`.
+The DINO extension uses the first window to turn MedDINOv3's input back into HU (this used
+to be hard-coded to `[-1000, 300]`); MedDINOv3 refuses min-max or CLAHE data. Data sliced
+before this file existed is treated as one `[-1000, 300]` window, as before.
 
 # Training-time slice filtering
 
