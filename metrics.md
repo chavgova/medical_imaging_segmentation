@@ -147,12 +147,18 @@ are missing.
 - `--num_classes` is optional; if omitted, the set of classes is inferred
   from the ground-truth volumes. Class `0` is always treated as background
   and excluded from scoring.
+- `--class_names` is optional and gives the organ name for each class index,
+  starting with background (same convention as `viewer/viewer.py`). It
+  defaults to the SegTHOR labels: `0` background, `1` esophagus, `2` heart,
+  `3` trachea, `4` aorta. A class index beyond the list is reported by its
+  number.
 - Produces two CSV files: `eval_metrics.csv` (one row per
-  `(patient_id, class)`, with `dice`/`hausdorff_distance_95`/
-  `average_surface_distance` columns — every individual score), and
-  `eval_metrics_summary.csv` (one row per class, with `..._mean`/`..._std`
-  columns, aggregated across patients with `np.nanmean`/`np.nanstd`). The
-  summary is also printed to stdout.
+  `(patient_id, class)`, with an `organ` column and
+  `dice`/`hausdorff_distance_95`/`average_surface_distance` columns — every
+  individual score), and `eval_metrics_summary.csv` (one row per organ, with
+  `..._mean`/`..._std` columns, aggregated across patients with
+  `np.nanmean`/`np.nanstd`). The summary is also printed to stdout, one block
+  per organ.
 - Error messages if a patient's ground truth
   can't be found via `gt_pattern`, or if a patient's prediction and
   ground-truth volumes have different shapes.
