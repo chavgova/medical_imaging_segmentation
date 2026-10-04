@@ -24,6 +24,7 @@ References:
 from typing import Any, Literal, get_args
 
 import torch
+import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from torch import nn, Tensor
 from transformers import AutoModel
@@ -42,9 +43,10 @@ HU_MIN, HU_MAX = -1000, 300
 
 
 class FrozenDino(nn.Module):
-    def __init__(self, dino: Dino):
+    def __init__(self, dino: Dino, upsample: int = 1):
         super().__init__()
         assert dino in get_args(Dino), f"unknown dino {dino!r}"
+        assert upsample in (1, 2, 4), "upsample must be 1, 2 or 4"
         self.dino: Dino = dino
         match dino:
             # Note that you need Hugging Face authentication and authorization to use these.
@@ -91,6 +93,8 @@ class FrozenDino(nn.Module):
         ), f"{dino} should have {expected} channels, not {self.embed_dim}"
         assert self.patch_size == 16, f"{dino} should have 16x16 patches"
         assert self.register_tokens == 4, f"{dino} should have 4 register tokens"
+        self.upsample: int = upsample
+        self.patch_size = self.patch_size // upsample
         self.model.requires_grad_(False)
         self.eval()
         assert not any(p.requires_grad for p in self.parameters())
@@ -121,6 +125,10 @@ class FrozenDino(nn.Module):
         grid = (height // self.patch_size, width // self.patch_size)
         center = x.size(1) // 2  # the middle slice with --context_slices
         image = x[:, center : center + 1]
+        if self.upsample > 1:
+            image = F.interpolate(
+                image, scale_factor=self.upsample, mode="bilinear", align_corners=False
+            ).clamp(0, 1)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=x.is_cuda):
             match self.dino:
                 case "dinov3-vits16" | "dinov3-vitb16":

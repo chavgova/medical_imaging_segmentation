@@ -70,14 +70,17 @@ datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'B': 8, 'model': 'enet'}
 
 def make_net(model: Model, in_channels: int, K: int, foundation_model: Dino | None = None,
              foundation_channels: int | None = None,
-             foundation_fusion: FoundationFusion | None = None) -> shallowCNN | ENet | UNet:
+             foundation_fusion: FoundationFusion | None = None,
+             foundation_upsample: int = 1) -> shallowCNN | ENet | UNet:
     assert foundation_model is None or model.startswith("unet"), \
         f"--foundation_model only works with the U-Nets, not {model}"
     assert (foundation_model is None) == (foundation_fusion is None), \
         "--foundation_fusion must be given exactly when there is a --foundation_model"
     assert foundation_model is not None or foundation_channels is None, \
         "--foundation_channels is only used with a --foundation_model"
-    frozen = FrozenDino(foundation_model) if foundation_model is not None else None
+    assert foundation_model is not None or foundation_upsample == 1, \
+        "--foundation_upsample is only used with a --foundation_model"
+    frozen = FrozenDino(foundation_model, foundation_upsample) if foundation_model is not None else None
     match model:
         case "shallowcnn":
             return shallowCNN(in_channels, K)
@@ -222,7 +225,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     K: int = datasets_params[args.dataset]['K']
     in_channels = 2 * args.context_slices + 1
     net = make_net(args.model, in_channels, K, args.foundation_model, args.foundation_channels,
-                   args.foundation_fusion)
+                   args.foundation_fusion, args.foundation_upsample)
     net.init_weights()
     net.to(device)
 
@@ -511,6 +514,10 @@ def main():
                         "the same as the foundation model's patch features: once in the encoder, once in the decoder. "
                         "I think the decoder is better since the DINO features are already contextualized. "
                         "But we could try both.")
+    parser.add_argument('--foundation_upsample', default=1, type=int, choices=[1, 2, 4],
+                        help="Upsample the slice by this factor before the foundation model "
+                             "so that if you upsample x2 than the output will be 32x32 instead "
+                             "of 16x16.")
     parser.add_argument('--data_dir', type=Path, default=None,
                         help='Processed train/val directory; defaults to data/SEGTHOR_smoke for '
                              'a SEGTHOR smoke run, otherwise data/<dataset>.')
@@ -606,8 +613,8 @@ def main():
     if args.context_slices < 0:
         parser.error('--context_slices must be 0 or more')
     if args.foundation_model is None:
-        if args.foundation_fusion is not None or args.foundation_channels is not None:
-            parser.error('--foundation_fusion and --foundation_channels need a --foundation_model')
+        if args.foundation_fusion is not None or args.foundation_channels is not None or args.foundation_upsample != 1:
+            parser.error('--foundation_fusion, --foundation_channels and --foundation_upsample need a --foundation_model')
     else:
         if not args.model.startswith('unet'):
             parser.error(f'--foundation_model only works with the U-Nets, not --model {args.model}')
