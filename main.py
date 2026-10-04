@@ -44,6 +44,7 @@ from ShallowNet import shallowCNN
 from ENet import ENet
 from UNet import UNet, FoundationFusion
 from dino import Dino, FrozenDino
+from slice_segthor import parse_hu_windows
 from utils import (Dcm,
                    class2one_hot,
                    probs2one_hot,
@@ -52,7 +53,8 @@ from utils import (Dcm,
                    dice_coef,
                    save_images,
                    estimate_flops,
-                   save_flops_count)
+                   save_flops_count,
+                   load_preprocessing)
 
 from losses import (CrossEntropy, Dice, DiceCE, Balance)
 import json
@@ -70,14 +72,17 @@ datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'B': 8, 'model': 'enet'}
 
 def make_net(model: Model, in_channels: int, K: int, foundation_model: Dino | None = None,
              foundation_channels: int | None = None,
-             foundation_fusion: FoundationFusion | None = None) -> shallowCNN | ENet | UNet:
+             foundation_fusion: FoundationFusion | None = None,
+             hu_window: tuple[float, float] | None = None, context_slices: int = 0,
+             n_windows: int = 1) -> shallowCNN | ENet | UNet:
     assert foundation_model is None or model.startswith("unet"), \
         f"--foundation_model only works with the U-Nets, not {model}"
     assert (foundation_model is None) == (foundation_fusion is None), \
         "--foundation_fusion must be given exactly when there is a --foundation_model"
     assert foundation_model is not None or foundation_channels is None, \
         "--foundation_channels is only used with a --foundation_model"
-    frozen = FrozenDino(foundation_model) if foundation_model is not None else None
+    frozen = FrozenDino(foundation_model, hu_window, context_slices, n_windows) \
+        if foundation_model is not None else None
     match model:
         case "shallowcnn":
             return shallowCNN(in_channels, K)
@@ -193,6 +198,26 @@ def save_config(args: argparse.Namespace) -> None:
     with open(args.dest / "config.json", "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
     
+# Data sliced before preprocessing.json existed: the exp_P1_HU window it was made with,
+# so MedDINOv3 runs on that data keep working as before.
+LEGACY_HU_WINDOW = (-1000.0, 300.0)
+
+
+def read_preprocessing(args: argparse.Namespace, root_dir: Path) -> tuple[int, tuple[float, float] | None]:
+    """The number of HU windows (image folders) in the data, and the HU window of the
+    first one (for MedDINOv3), from the preprocessing.json written by slice_segthor.py."""
+    preprocessing = load_preprocessing(root_dir)
+    args.preprocessing = preprocessing  # also saved in config.json
+    if preprocessing is None:
+        return 1, LEGACY_HU_WINDOW
+
+    windows = preprocessing["windows"]
+    n_windows = len(windows) if preprocessing["method"] == "multiwindow" else 1
+    # min-max and CLAHE don't keep a linear HU mapping
+    hu_window = tuple(windows[0]) if preprocessing["method"] in ("hu", "multiwindow") else None
+    return n_windows, hu_window
+
+
 def img_transform(img):
         img = img.convert('L')
         img = np.array(img)[np.newaxis, ...]
@@ -220,9 +245,11 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
-    in_channels = 2 * args.context_slices + 1
+    root_dir = args.data_dir if args.data_dir is not None else Path("data") / args.dataset
+    n_windows, hu_window = read_preprocessing(args, root_dir)
+    in_channels = (2 * args.context_slices + 1) * n_windows
     net = make_net(args.model, in_channels, K, args.foundation_model, args.foundation_channels,
-                   args.foundation_fusion)
+                   args.foundation_fusion, hu_window, args.context_slices, n_windows)
     net.init_weights()
     net.to(device)
 
@@ -237,7 +264,6 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 
     # Dataset part
     B: int = datasets_params[args.dataset]['B']
-    root_dir = args.data_dir if args.data_dir is not None else Path("data") / args.dataset
 
     generator = None
     worker_init_fn = None
@@ -254,7 +280,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
         augment=args.augment,
         debug=args.debug,
         drop_empty_slices=args.drop_empty_slices,
-        context_slices=args.context_slices)
+        context_slices=args.context_slices,
+        n_windows=n_windows)
 
     train_sampler = None
     if args.oversample_foreground:
@@ -276,7 +303,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
         img_transform=img_transform,
         gt_transform=partial(gt_transform, K),
         debug=args.debug,
-        context_slices=args.context_slices)
+        context_slices=args.context_slices,
+        n_windows=n_windows)
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=5,
@@ -469,7 +497,7 @@ def runTraining(args):
 
 
 def ensure_smoke_data(data_dir: Path, source_dir: Path, hu_min=None, hu_max=None, use_clahe=False,
-                      target_spacing=None, fix_aorta_esophagus=False):
+                      target_spacing=None, fix_aorta_esophagus=False, hu_windows=None):
     """Create smoke data only if its directory does not exist."""
     if data_dir.exists():
         print(f'Reusing smoke dataset: {data_dir}')
@@ -482,6 +510,8 @@ def ensure_smoke_data(data_dir: Path, source_dir: Path, hu_min=None, hu_max=None
         command += ['--hu_min', str(hu_min), '--hu_max', str(hu_max)]
     if use_clahe:
         command += ['--clahe']
+    if hu_windows is not None:
+        command += ['--hu_windows'] + [str(bound) for window in hu_windows for bound in window]
     if target_spacing is not None:
         command += ['--target_spacing', str(target_spacing)]
     if fix_aorta_esophagus:
@@ -521,9 +551,13 @@ def main():
     parser.add_argument('--hu_max', type=float, default=None,
                         help='Smoke preprocessing HU upper bound; requires --hu_min.')
     parser.add_argument('--clahe', action='store_true',
-                        help='Smoke preprocessing: clip to [-1000, 300] then CLAHE instead of '
-                             'linear normalization. Mutually exclusive with --hu_min/--hu_max. '
+                        help='Smoke preprocessing: clip to the --hu_min/--hu_max window (default '
+                             '[-1000, 300]) then CLAHE instead of linear normalization. '
                              'Default off; requires a fresh --data_dir.')
+    parser.add_argument('--hu_windows', type=float, nargs='+', default=None, metavar='LO HI',
+                        help='Smoke preprocessing: several HU windows as LO HI pairs, each its own '
+                             'input channel. Mutually exclusive with --hu_min/--hu_max and --clahe; '
+                             'requires a fresh --data_dir.')
     parser.add_argument('--target_spacing', type=float, default=None,
                         help='Smoke preprocessing target in-plane spacing (mm/pixel); '
                              'requires a fresh --data_dir, same as --hu_min/--hu_max.')
@@ -597,8 +631,7 @@ def main():
     if args.hu_min is not None and not (np.isfinite(args.hu_min) and np.isfinite(args.hu_max)
                                         and args.hu_min < args.hu_max):
         parser.error('HU bounds must be finite, with --hu_min < --hu_max')
-    if args.clahe and args.hu_min is not None:
-        parser.error('--clahe and --hu_min/--hu_max are mutually exclusive normalization choices')
+    args.hu_windows = parse_hu_windows(parser, args)
     if args.dataset is None:
         args.dataset = 'SEGTHOR' if args.test_pipeline else 'TOY2'
     if args.model is None:
@@ -628,7 +661,7 @@ def main():
             if args.data_dir is None:
                 args.data_dir = Path('data/SEGTHOR_smoke')
             ensure_smoke_data(args.data_dir, args.source_dir, args.hu_min, args.hu_max, args.clahe,
-                              args.target_spacing, args.fix_aorta_esophagus)
+                              args.target_spacing, args.fix_aorta_esophagus, args.hu_windows)
 
     if args.deterministic:
         set_deterministic(args.seed)
