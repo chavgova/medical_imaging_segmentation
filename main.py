@@ -469,7 +469,7 @@ def runTraining(args):
 
 
 def ensure_smoke_data(data_dir: Path, source_dir: Path, hu_min=None, hu_max=None, use_clahe=False,
-                      target_spacing=None, fix_aorta_esophagus=False):
+                      target_spacing=None, fix_aorta_esophagus=False, crop_body=False):
     """Create smoke data only if its directory does not exist."""
     if data_dir.exists():
         print(f'Reusing smoke dataset: {data_dir}')
@@ -486,6 +486,8 @@ def ensure_smoke_data(data_dir: Path, source_dir: Path, hu_min=None, hu_max=None
         command += ['--target_spacing', str(target_spacing)]
     if fix_aorta_esophagus:
         command += ['--fix_aorta_esophagus']
+    if crop_body:
+        command += ['--crop_body']
     subprocess.run(command, check=True)
 
 
@@ -529,6 +531,9 @@ def main():
                              'requires a fresh --data_dir, same as --hu_min/--hu_max.')
     parser.add_argument('--fix_aorta_esophagus', action='store_true',
                         help='Smoke preprocessing: split the merged aorta/esophagus label. '
+                             'Default off; requires a fresh --data_dir, same as --hu_min/--hu_max.')
+    parser.add_argument('--crop_body', action='store_true',
+                        help='Smoke preprocessing: crop to the body bounding box before resizing. '
                              'Default off; requires a fresh --data_dir, same as --hu_min/--hu_max.')
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
     parser.add_argument('--dest', type=Path,
@@ -628,7 +633,7 @@ def main():
             if args.data_dir is None:
                 args.data_dir = Path('data/SEGTHOR_smoke')
             ensure_smoke_data(args.data_dir, args.source_dir, args.hu_min, args.hu_max, args.clahe,
-                              args.target_spacing, args.fix_aorta_esophagus)
+                              args.target_spacing, args.fix_aorta_esophagus, args.crop_body)
 
     if args.deterministic:
         set_deterministic(args.seed)

@@ -129,6 +129,65 @@ def keep_largest_component(mask: np.ndarray) -> np.ndarray:
     return labeled == (int(np.argmax(sizes)) + 1)
 
 
+def compute_body_bbox(ct: np.ndarray, soft_threshold: float = -500.0,
+                      bone_threshold: float = 300.0, separation: int = 12,
+                      margin: int = 15) -> tuple[slice, slice]:
+    """(row, col) bounding box containing the body across every slice in this
+    volume.
+
+    A plain "largest connected component of soft tissue" picks the scanner
+    table/cushion whenever it happens to touch the body in even one slice
+    (common -- roughly a third of a 40-patient sample), and raw bone
+    brightness alone is derailed by thin metal-artifact streaks (which
+    exceed bone-level HU but are only 1-3 voxels wide). Combining both
+    fixes each other's failure mode:
+
+    - `bone`: thresholded at true bone brightness, then lightly eroded.
+      The table never reaches this brightness, and the erosion wipes out
+      thin streak artifacts while leaving solid real bone intact -- so
+      this mask is a clean, body-only anchor.
+    - `soft`: the usual soft-tissue threshold, giving the true full body
+      envelope (skin surface), but still liable to fuse with the table.
+      Eroding it first by `separation` voxels severs any thin body/table
+      contact bridge before labeling, so the component overlapping `bone`
+      can be safely picked out (immune to the fused blob simply being the
+      largest). Dilating that choice back by the same amount restores its
+      original extent.
+
+    One box for the whole volume (not per slice) keeps every slice cropped
+    identically, so z-stacking (context_slices) and 3D volume stitching
+    stay spatially consistent. Note: this does not detect which z-range is
+    thoracic, so a scan that extends into the neck or pelvis will still
+    size the box to that wider anatomy -- safe (nothing real gets clipped),
+    just less tight for those patients.
+    """
+    struct2d = np.ones((3, 3, 1))  # per-slice connectivity, no bleed across z
+
+    bone = ct > bone_threshold
+    bone = ndimage.binary_erosion(bone, structure=struct2d, iterations=2)
+
+    soft = ct > soft_threshold
+    filled = ndimage.binary_fill_holes(soft)
+    eroded = ndimage.binary_erosion(filled, structure=struct2d, iterations=separation)
+
+    labeled, n = ndimage.label(eroded, structure=np.ones((3, 3, 3)))
+    if n == 0:
+        body = filled
+    else:
+        overlap = set(np.unique(labeled[bone & (labeled > 0)]))
+        if overlap:
+            body_eroded = np.isin(labeled, list(overlap))
+        else:
+            sizes = ndimage.sum(eroded, labeled, range(1, n + 1))
+            body_eroded = labeled == (int(np.argmax(sizes)) + 1)
+        body = ndimage.binary_dilation(body_eroded, structure=struct2d, iterations=separation)
+
+    rows, cols = np.where(body.any(axis=2))
+    r0, r1 = max(rows.min() - margin, 0), min(rows.max() + margin + 1, ct.shape[0])
+    c0, c1 = max(cols.min() - margin, 0), min(cols.max() + margin + 1, ct.shape[1])
+    return slice(r0, r1), slice(c0, c1)
+
+
 def split_merged_aorta_esophagus(gt: np.ndarray, r: int = 4) -> np.ndarray:
     """ In the GT files aorta and esophagus are merged into the same label (1). This function takes the GT and splits them into two separate labels (1 for esophagus, 4 for aorta) using erotion and dilation operations. The aorta is much thicker
     than the esophagus, so eroding by r voxels leaves only the aorta's core.
@@ -165,7 +224,8 @@ def split_merged_aorta_esophagus(gt: np.ndarray, r: int = 4) -> np.ndarray:
 
 def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int],
                   test_mode: bool = False, hu_min=None, hu_max=None, use_clahe: bool = False,
-                  target_spacing=None, fix_aorta_esophagus: bool = False) -> tuple[float, float, float]:
+                  target_spacing=None, fix_aorta_esophagus: bool = False,
+                  crop_body: bool = False) -> tuple[float, float, float]:
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
     ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
@@ -188,6 +248,12 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
             gt = split_merged_aorta_esophagus(gt)
     else:
         gt = np.zeros_like(ct, dtype=np.uint8)
+
+    if crop_body:
+        row_sl, col_sl = compute_body_bbox(ct)
+        ct = ct[row_sl, col_sl]
+        gt = gt[row_sl, col_sl]
+        x, y = ct.shape[0], ct.shape[1]
 
     norm_ct: np.ndarray = norm_arr(ct, hu_min, hu_max, use_clahe)
 
@@ -288,7 +354,8 @@ def main(args: argparse.Namespace):
                                  hu_max=args.hu_max,
                                  use_clahe=args.clahe,
                                  target_spacing=args.target_spacing,
-                                 fix_aorta_esophagus=args.fix_aorta_esophagus)
+                                 fix_aorta_esophagus=args.fix_aorta_esophagus,
+                                 crop_body=args.crop_body)
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
         match args.process:
@@ -327,6 +394,11 @@ def get_args() -> argparse.Namespace:
                         help='Split the aorta back out of the merged esophagus label (1) using '
                              'erosion/dilation by shape. Default: off, keeps the original merged '
                              'label unchanged. See split_merged_aorta_esophagus() for details.')
+    parser.add_argument('--crop_body', action='store_true',
+                        help='Crop to the body bounding box (one box per patient, computed from '
+                             'raw HU across the whole scan) before resizing to --shape, removing '
+                             'background air and the scanner table/cushion. Default: off, resizes '
+                             'the full uncropped slice like before. See compute_body_bbox().')
     parser.add_argument('--retains', type=int, default=25, help="Number of retained patient for the validation data")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--fold', type=int, default=0)
