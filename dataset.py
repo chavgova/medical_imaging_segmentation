@@ -85,12 +85,16 @@ def _drop_empty_gt_slices(files: list[tuple[Path, Path | None]],
 class SliceDataset(Dataset):
     def __init__(self, subset, root_dir, img_transform=None,
              gt_transform=None, augment=False, equalize=False, debug=False,
-             context_slices: int = 0, drop_empty_slices: float = 0.0, n_windows: int = 1):
+             context_slices: int = 0, drop_empty_slices: float = 0.0, n_windows: int = 1,
+             augment_scale: float = 0.0):
 
         self.root_dir: str = root_dir
         self.img_transform: Callable | None = img_transform
         self.gt_transform: Callable | None = gt_transform
         self.augmentation: bool = augment and subset == 'train'
+        # Max relative zoom of the augmentation, e.g. 0.15 for a factor in [0.85, 1.15]
+        self.augment_scale: float = augment_scale
+        assert 0.0 <= self.augment_scale < 1.0
         self.equalize: bool = equalize
         self.context_slices: int = context_slices
         assert self.context_slices >= 0
@@ -158,8 +162,22 @@ class SliceDataset(Dataset):
                     neighbor_imgs.append(self.img_transform(im.copy()))
         img: Tensor = torch.cat(neighbor_imgs, dim=0)
 
+        angle = 0.0
         if self.augmentation and torch.rand(()).item() < 0.5:
             angle = torch.empty(()).uniform_(-5.0, 5.0).item()
+
+
+        scale = 1.0
+        if self.augmentation and self.augment_scale > 0 and torch.rand(()).item() < 0.5:
+            scale = torch.empty(()).uniform_(1 - self.augment_scale, 1 + self.augment_scale).item()
+
+        if scale != 1.0:
+            
+            img = TF.affine(img, angle=angle, translate=[0, 0], scale=scale, shear=[0.0],
+                            interpolation=InterpolationMode.BILINEAR, fill=0)
+            gt_pil = TF.affine(gt_pil, angle=angle, translate=[0, 0], scale=scale, shear=[0.0],
+                               interpolation=InterpolationMode.NEAREST, fill=0)
+        elif angle != 0.0:
             img = TF.rotate(img, angle=angle, interpolation=InterpolationMode.BILINEAR, expand=False, fill=0)
             gt_pil = TF.rotate(gt_pil, angle=angle, interpolation=InterpolationMode.NEAREST, expand=False, fill=0)
 

@@ -366,6 +366,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
         img_transform=img_transform,
         gt_transform=partial(gt_transform, K),
         augment=args.augment,
+        augment_scale=args.augment_scale,
         debug=args.debug,
         drop_empty_slices=args.drop_empty_slices,
         context_slices=args.context_slices,
@@ -951,6 +952,14 @@ def main():
         help="Turn on augmentation for the training data.",
     )
     parser.add_argument(
+        "--augment_scale",
+        type=float,
+        default=0.0,
+        help="With --augment: also zoom half of the training slices by a random factor "
+        "in [1 - x, 1 + x], e.g. 0.15. Covers the 0.90-1.37 mm spread in pixel "
+        "spacing between patients. Default 0 (off) keeps --augment as before.",
+    )
+    parser.add_argument(
         "--drop_empty_slices",
         type=float,
         default=0.0,
@@ -964,6 +973,10 @@ def main():
         parser.error("Supply --hu_min and --hu_max together")
     if not (0.0 <= args.drop_empty_slices <= 1.0):
         parser.error("--drop_empty_slices must be between 0 and 1")
+    if not (0.0 <= args.augment_scale < 1.0):
+        parser.error("--augment_scale must be in [0, 1)")
+    if args.augment_scale > 0 and not args.augment:
+        parser.error("--augment_scale only works together with --augment")
     if args.hu_min is not None and not (
         np.isfinite(args.hu_min)
         and np.isfinite(args.hu_max)

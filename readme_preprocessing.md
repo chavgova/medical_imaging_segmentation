@@ -152,10 +152,10 @@ never augmented.
 | Operation | Probability per loaded training slice | Parameters | Applied to |
 | --- | --- | --- | --- |
 | Small in-plane rotation | 50% | Angle sampled uniformly from -5 to +5 degrees | CT image and mask, using the same angle |
-| Additive Gaussian noise | 25% | Zero-mean noise with standard deviation sampled uniformly from 0 to 0.1 | CT image only |
+| Random zoom (only with `--augment_scale x`) | 50% | Factor sampled uniformly from `1 - x` to `1 + x` | CT image and mask, using the same factor |
+| Additive Gaussian noise | 25% | Zero-mean noise with standard deviation sampled uniformly from 0 to 0.01 | CT image only |
 
-The two decisions are independent: a slice can receive either operation, both,
-or neither. Random values are sampled again whenever a slice is loaded. No
+The decisions are independent: a slice can receive any combination of the operations. Random values are sampled again whenever a slice is loaded. No
 augmented images are written to disk, and the number of samples per epoch stays
 the same. Offline augmentation would instead save transformed copies in advance.
 
@@ -169,12 +169,14 @@ Noise is added after `img_transform` converts the CT image into a floating-point
 tensor in `[0, 1]`. Values are clamped back to `[0, 1]` afterward. Noise never
 changes the mask. `gt_transform` still converts the mask to one-hot labels.
 
-**Noise strength:** the current maximum standard deviation is `0.1`. The mild
-starting setting discussed for this project is `0.01`, ten times smaller. To use
-that setting, change the sampling line in `dataset.py` to:
+**Random zoom** (`--augment_scale`, off by default):  Zooming by e.g. `--augment_scale 0.15` (factor 0.85-1.15) teaches the network that range
+without resampling the data. Zooming out fills the
+border with zero (black, background); zooming in clips the outer edge. With the flag
+off, `--augment` draws exactly the same random numbers as before, so earlier runs stay
+reproducible.
 
-```python
-noise_std = torch.empty(()).uniform_(0.0, 0.01).item()
+```bash
+python main.py ... --augment --augment_scale 0.15
 ```
 
 ### Why these choices fit this CT pipeline
@@ -184,7 +186,6 @@ noise_std = torch.empty(()).uniform_(0.0, 0.01).item()
 - **Gaussian noise:** a practical robustness augmentation for reconstructed CT
   images, also used in [CT segmentation research](https://www.nature.com/articles/s41598-020-67544-y). See
   [CT noise-model study](https://pmc.ncbi.nlm.nih.gov/articles/PMC5783547/).
-- **Full slices:** there is no random patch sampling, scaling, translation,
   gamma adjustment, or elastic deformation in this implementation.
 
 # Example commands
