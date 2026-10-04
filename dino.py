@@ -35,17 +35,19 @@ from transformers import AutoModel
 # is MedDINOv3: the ViT-B/16 trained further on 3.87M CT slices (CT-3M).
 Dino = Literal["dinov3-vits16", "dinov3-vitb16", "meddinov3-vitb16"]
 
-# The HU window of our exp_P1_HU data (slice_segthor.py --hu_min -1000 --hu_max 300),
-# which stores it as 0 to 1. Only for MedDINOv3, which normalizes the raw HU values,
-# so these turn our inputs back into HU. DINOv3 takes the 0 to 1 values as they are.
-HU_MIN, HU_MAX = -1000, 300
-
-
 class FrozenDino(nn.Module):
-    def __init__(self, dino: Dino):
+    def __init__(self, dino: Dino, hu_window: tuple[float, float] | None = None,
+                 context_slices: int = 0, n_windows: int = 1):
         super().__init__()
         assert dino in get_args(Dino), f"unknown dino {dino!r}"
+        assert (
+            dino != "meddinov3-vitb16" or hu_window is not None
+        ), "MedDINOv3 needs data with a fixed HU window (--hu_min/--hu_max or --hu_windows)"
+        assert context_slices >= 0 and n_windows >= 1
         self.dino: Dino = dino
+        self.hu_window: tuple[float, float] | None = hu_window
+        self.context_slices: int = context_slices
+        self.n_windows: int = n_windows
         match dino:
             # Note that you need Hugging Face authentication and authorization to use these.
             case "dinov3-vits16" | "dinov3-vitb16":
