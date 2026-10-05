@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=exp_P1_HU_percentile_prep
+#SBATCH --job-name=exp_A1_scale015_submit
 #SBATCH --partition=rome
 #SBATCH --cpus-per-task=16
-#SBATCH --time=02:00:00
+#SBATCH --time=00:10:00
 #SBATCH --account=gpuuva084
 #SBATCH --output=logs/slurm_%x_%j.out
 
 set -euo pipefail
 
-STAGE="${1:-prepare}"
+STAGE="${1:-submit}"
 REPO="$HOME/ai4mi_project"
-SCRIPT="$REPO/jobs/exp_P1_HU_percentile.sh"
-DATA_DIR="$REPO/data/segthor_seed43/exp_P1_HU_percentile"
-EXPERIMENT_DIR="$REPO/results/segthor_seed43/exp_P1_HU_percentile"
+SCRIPT="$REPO/jobs/exp_A1_scale015.sh"
+DATA_DIR="$REPO/data/segthor_seed43/exp_P1_HU"
+EXPERIMENT_DIR="$REPO/results/segthor_seed43/exp_A1_scale015"
 RESULT_DIR="$EXPERIMENT_DIR/results"
 LOG_DIR="$EXPERIMENT_DIR/logs"
 SOURCE_DIR="$REPO/data/segthor_part1"
@@ -31,29 +31,24 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export MPLBACKEND=Agg
 
 case "$STAGE" in
-    prepare)
-        mkdir -p "$LOG_DIR"
-        # preprocessing.json is only written after slicing finishes successfully,
-        # so this also catches (and re-slices from scratch) a directory left
-        # behind by a crashed or timed-out previous attempt -- a plain
-        # directory-existence check would silently treat that partial data as done.
-        if [ ! -f "$DATA_DIR/preprocessing.json" ]; then
-            rm -rf "$DATA_DIR"
-            python slice_segthor.py --source_dir "$SOURCE_DIR" --dest_dir "$DATA_DIR" \
-                --shape 256 256 --retains 5 --seed 43 --fold 0 \
-                --hu_percentile \
-                --process "$SLURM_CPUS_PER_TASK"
+    submit)
+        if [ ! -d "$DATA_DIR/train/img" ] || [ ! -d "$DATA_DIR/val/img" ]; then
+            echo "Missing P1 data: $DATA_DIR" >&2
+            exit 1
         fi
-        sbatch --job-name=exp_P1_HU_percentile_train --partition=gpu_a100 --gpus=1 \
+        mkdir -p "$LOG_DIR"
+        sbatch --job-name=exp_A1_scale015_train --partition=gpu_a100 --gpus=1 \
             --cpus-per-task=18 --time=04:00:00 --account=gpuuva084 \
             --output="$LOG_DIR/slurm_train_%j.out" "$SCRIPT" train
         ;;
     train)
         python main.py --dataset SEGTHOR --mode full --epochs 25 \
             --data_dir "$DATA_DIR" --dest "$RESULT_DIR" --gpu \
-            --loss_fn ce --opt adam --lr 0.0005 --context_slices 0 \
-            --scheduler none --deterministic --seed 43
-        sbatch --job-name=exp_P1_HU_percentile_eval --partition=rome --cpus-per-task=16 \
+            --loss_fn balance --balance_alpha 0.5 --balance_t 0.9 \
+            --balance_fallback_epoch -1 --balance_normalized \
+            --opt adam --lr 0.0005 --context_slices 2 \
+            --scheduler none --deterministic --seed 43 --augment --augment_scale 0.15
+        sbatch --job-name=exp_A1_scale015_eval --partition=rome --cpus-per-task=16 \
             --time=01:00:00 --account=gpuuva084 \
             --output="$LOG_DIR/slurm_eval_%j.out" "$SCRIPT" evaluate
         ;;

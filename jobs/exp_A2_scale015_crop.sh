@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=exp_P1_HU_310_400_crop_prep
+#SBATCH --job-name=exp_A2_scale015_crop_prep
 #SBATCH --partition=rome
 #SBATCH --cpus-per-task=16
 #SBATCH --time=02:00:00
@@ -10,12 +10,18 @@ set -euo pipefail
 
 STAGE="${1:-prepare}"
 REPO="$HOME/ai4mi_project"
-SCRIPT="$REPO/jobs/exp_P1_HU_310_400_crop.sh"
-DATA_DIR="$REPO/data/segthor_seed43/exp_P1_HU_310_400_crop"
-EXPERIMENT_DIR="$REPO/results/segthor_seed43/exp_P1_HU_310_400_crop"
+SCRIPT="$REPO/jobs/exp_A2_scale015_crop.sh"
+DATA_DIR="$REPO/data/segthor_seed43/exp_A2_scale015_crop"
+EXPERIMENT_DIR="$REPO/results/segthor_seed43/exp_A2_scale015_crop"
 RESULT_DIR="$EXPERIMENT_DIR/results"
 LOG_DIR="$EXPERIMENT_DIR/logs"
 SOURCE_DIR="$REPO/data/segthor_part1"
+
+# TBC: the normalization flags of the best P experiment (P1, P2 or P3), e.g.
+#   P1: --hu_min -310 --hu_max 400
+#   P2: --clahe --hu_min -310 --hu_max 400
+#   P3: --hu_windows -1000 300 -310 400
+PREPROCESS_FLAGS=""
 
 module load 2023
 module load Python/3.11.3-GCCcore-12.3.0
@@ -32,6 +38,10 @@ export MPLBACKEND=Agg
 
 case "$STAGE" in
     prepare)
+        if [ -z "$PREPROCESS_FLAGS" ]; then
+            echo "Set PREPROCESS_FLAGS to the best P experiment first" >&2
+            exit 1
+        fi
         mkdir -p "$LOG_DIR"
         # preprocessing.json is only written after slicing finishes successfully,
         # so this also catches (and re-slices from scratch) a directory left
@@ -41,19 +51,21 @@ case "$STAGE" in
             rm -rf "$DATA_DIR"
             python slice_segthor.py --source_dir "$SOURCE_DIR" --dest_dir "$DATA_DIR" \
                 --shape 256 256 --retains 5 --seed 43 --fold 0 \
-                --hu_min -310 --hu_max 400 --crop_body \
+                $PREPROCESS_FLAGS --crop_body \
                 --process "$SLURM_CPUS_PER_TASK"
         fi
-        sbatch --job-name=exp_P1_HU_310_400_crop_train --partition=gpu_a100 --gpus=1 \
+        sbatch --job-name=exp_A2_scale015_crop_train --partition=gpu_a100 --gpus=1 \
             --cpus-per-task=18 --time=04:00:00 --account=gpuuva084 \
             --output="$LOG_DIR/slurm_train_%j.out" "$SCRIPT" train
         ;;
     train)
         python main.py --dataset SEGTHOR --mode full --epochs 25 \
             --data_dir "$DATA_DIR" --dest "$RESULT_DIR" --gpu \
-            --loss_fn ce --opt adam --lr 0.0005 --context_slices 0 \
-            --scheduler none --deterministic --seed 43
-        sbatch --job-name=exp_P1_HU_310_400_crop_eval --partition=rome --cpus-per-task=16 \
+            --loss_fn balance --balance_alpha 0.5 --balance_t 0.9 \
+            --balance_fallback_epoch -1 --balance_normalized \
+            --opt adam --lr 0.0005 --context_slices 2 \
+            --scheduler none --deterministic --seed 43 --augment --augment_scale 0.15
+        sbatch --job-name=exp_A2_scale015_crop_eval --partition=rome --cpus-per-task=16 \
             --time=01:00:00 --account=gpuuva084 \
             --output="$LOG_DIR/slurm_eval_%j.out" "$SCRIPT" evaluate
         ;;
