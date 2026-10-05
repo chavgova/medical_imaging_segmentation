@@ -1,14 +1,17 @@
 # Metrics
 
 [`metrics.py`](metrics.py) provides dataset-independent segmentation evaluation
-metrics: 3D Dice, 95th-percentile Hausdorff Distance (HD95), and Average
-Surface Distance (ASD). They operate on plain numpy label maps (not one-hot,
-not torch tensors), take no dataset-specific assumptions (no hardcoded class
-counts, no class-value scaling), and work for binary or multi-class volumes.
+metrics: IoU, 3D Dice, 95th-percentile Hausdorff Distance (HD95), Average
+Surface Distance (ASD), and a voxel-wise confusion matrix. They operate on
+plain numpy label maps (not one-hot, not torch tensors), take no
+dataset-specific assumptions (no class-value scaling; `confusion_matrix`'s
+`n_classes=5` is only a SegTHOR default), and work for binary or multi-class
+volumes.
 
-All four functions score a single class `c` at a time, except `dice`, which
-loops over classes internally. For multi-class HD95/ASD, loop over class
-values on the caller side (see examples below).
+`iou`, `hausdorff_distance_95` and `average_surface_distance` score a single
+class `c` at a time; `dice` loops over classes internally, and
+`confusion_matrix` covers all classes at once. For multi-class HD95/ASD, loop
+over class values on the caller side (see examples below).
 
 ## `iou(pred, gt, c=1)`
 
@@ -96,13 +99,48 @@ asd = average_surface_distance(pred_volume, gt_volume, spacing=(0.98, 0.98, 2.5)
 **Edge case:** identical to `hausdorff_distance_95` â `0.0` when the class is
 absent from both volumes, `float("nan")` when it's present in only one.
 
+## `confusion_matrix(gt, pred, n_classes=5, spacing=None)`
+
+Voxel-wise confusion matrix of shape `(n_classes, n_classes)`: **rows are
+ground-truth labels, columns are predicted labels**, so entry `[i, j]` is the
+number of voxels of true class `i` predicted as class `j`. Note the
+`(gt, pred)` argument order, the reverse of the other functions. Computed in
+one pass with `np.bincount` on `n_classes * gt + pred`.
+
+```python
+from metrics import confusion_matrix
+
+cm = confusion_matrix(gt_volume, pred_volume, n_classes=5)
+missed_esophagus_as_aorta = cm[1, 4]
+
+# Volumes in mm³ (float) instead of voxel counts (int)
+cm_mm3 = confusion_matrix(gt_volume, pred_volume, n_classes=5, spacing=(0.98, 0.98, 2.5))
+```
+
+Row sums are the ground-truth label counts and column sums the predicted
+label counts. Raises `ValueError` if `gt`/`pred` shapes differ, if a label is
+negative or `>= n_classes`, or if `spacing` doesn't have one value per axis.
+
 ## Implementation notes
 
-`hausdorff_distance_95` and `average_surface_distance` share the same
-surface-extraction approach: binary erosion (`scipy.ndimage.binary_erosion`)
-to find each mask's boundary voxels, then `scipy.ndimage.distance_transform_edt`
-with `sampling=spacing` to get physically-scaled nearest-boundary distances in
-each direction.
+`hausdorff_distance_95` and `average_surface_distance` delegate the distance
+computation to [MONAI](https://docs.monai.io/en/stable/metrics.html):
+`monai.metrics.compute_hausdorff_distance(percentile=95, directed=False)` and
+`monai.metrics.compute_average_surface_distance(symmetric=True)`, with
+`spacing` passed through so distances are in mm. MONAI finds each mask's
+boundary voxels by binary erosion, then computes exact Euclidean
+nearest-boundary distances in each direction (a KD-tree on CPU; cuCIM's GPU
+distance transform for CUDA tensors when cuCIM is installed).
+
+Both functions take an optional `device` argument (default `"cpu"`). With
+`device="cuda"` the masks are moved to the GPU and MONAI uses cuCIM's GPU
+erosion and distance transform. This needs cuCIM and CuPy installed: without
+them MONAI computes the distances of CUDA tensors with SciPy on CPU, which is
+slower than the CPU path.
+
+The empty-mask rules above (`0.0` / `NaN`) are applied by our wrappers before
+MONAI is called; MONAI on its own would return `NaN` when both masks are empty
+and `NaN`/`inf` when only one is.
 
 ## eval.py
 
@@ -140,12 +178,36 @@ are missing.
 - `--num_classes` is optional; if omitted, the set of classes is inferred
   from the ground-truth volumes. Class `0` is always treated as background
   and excluded from scoring.
+- `--class_names` is optional and gives the organ name for each class index,
+  starting with background (same convention as `viewer/viewer.py`). It
+  defaults to the SegTHOR labels: `0` background, `1` esophagus, `2` heart,
+  `3` trachea, `4` aorta. A class index beyond the list is reported by its
+  number.
+- `--gpu` computes HD95/ASSD on the GPU (Dice always runs on CPU). It is
+  only used when CUDA is available and cuCIM and CuPy are installed
+  (e.g. `pip install cupy-cuda12x cucim-cu12` for CUDA 12); otherwise
+  `eval.py` prints why and evaluates on CPU. The device used is printed at
+  the start.
+- `--confusion_matrix` also saves voxel-count confusion matrices (rows =
+  ground truth, columns = prediction, size `--num_classes`, or the number of
+  `--class_names` if omitted), computed on exactly the predictions that are
+  scored, i.e. after any `--postprocessing`: `eval_metrics_confusion_matrix.npz`, mapping
+  each patient id to its `(K, K)` matrix (the readme's `.npz` submission
+  format; load with `np.load(path)["Patient_01"]`), and
+  `eval_metrics_confusion_matrix.png`, a heatmap of the matrix summed over
+  all patients. Each cell is colored by its share of the ground-truth row
+  (raw counts are dominated by background) and annotated with that share and
+  the voxel count; organs absent from the ground truth show "no GT".
 - Produces two CSV files: `eval_metrics.csv` (one row per
-  `(patient_id, class)`, with `dice`/`hausdorff_distance_95`/
-  `average_surface_distance` columns — every individual score), and
-  `eval_metrics_summary.csv` (one row per class, with `..._mean`/`..._std`
-  columns, aggregated across patients with `np.nanmean`/`np.nanstd`). The
-  summary is also printed to stdout.
+  `(patient_id, class)`, with an `organ` column and
+  `dice`/`hausdorff_distance_95`/`average_surface_distance` columns — every
+  individual score), and `eval_metrics_summary.csv` (one row per organ, with
+  `..._mean`/`..._std` columns, aggregated across patients with
+  `np.nanmean`/`np.nanstd`, and a `..._nan_count` column giving how many
+  patients were NaN for that metric and therefore left out of the mean/std —
+  for HD95/ASSD, the patients where the organ was missed or falsely
+  predicted). The summary is also printed to stdout, one block per organ,
+  with the NaN count next to each metric.
 - Error messages if a patient's ground truth
   can't be found via `gt_pattern`, or if a patient's prediction and
   ground-truth volumes have different shapes.
