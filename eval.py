@@ -143,6 +143,8 @@ def summarize(rows: Sequence[dict], metrics: Sequence[str]) -> list[dict]:
         for name in metric_names:
             summary_row[f"{name}_mean"] = float(np.nanmean(values[name]))
             summary_row[f"{name}_std"] = float(np.nanstd(values[name]))
+            # patients excluded from the mean/std above (e.g. HD95 when the organ is missed or falsely predicted)
+            summary_row[f"{name}_nan_count"] = int(np.isnan(values[name]).sum())
 
         summary.append(summary_row)
 
@@ -163,7 +165,8 @@ def print_summary(summary: Sequence[dict], metrics: Sequence[str]) -> None:
     for row in summary:
         print(f"{row['organ']} (class {row['class']}): ")
         for metric in metrics:
-            print(f"  {metric}: {row[f'{metric}_mean']:.4f} +/- {row[f'{metric}_std']:.4f}")
+            print(f"  {metric}: {row[f'{metric}_mean']:.4f} +/- {row[f'{metric}_std']:.4f}"
+                  f" (NaN: {row[f'{metric}_nan_count']})")
 
 
 def main(args: argparse.Namespace) -> None:
