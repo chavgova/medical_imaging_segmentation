@@ -107,6 +107,12 @@ boundary voxels by binary erosion, then computes exact Euclidean
 nearest-boundary distances in each direction (a KD-tree on CPU; cuCIM's GPU
 distance transform for CUDA tensors when cuCIM is installed).
 
+Both functions take an optional `device` argument (default `"cpu"`). With
+`device="cuda"` the masks are moved to the GPU and MONAI uses cuCIM's GPU
+erosion and distance transform. This needs cuCIM and CuPy installed: without
+them MONAI computes the distances of CUDA tensors with SciPy on CPU, which is
+slower than the CPU path.
+
 The empty-mask rules above (`0.0` / `NaN`) are applied by our wrappers before
 MONAI is called; MONAI on its own would return `NaN` when both masks are empty
 and `NaN`/`inf` when only one is.
@@ -152,6 +158,11 @@ are missing.
   defaults to the SegTHOR labels: `0` background, `1` esophagus, `2` heart,
   `3` trachea, `4` aorta. A class index beyond the list is reported by its
   number.
+- `--gpu` computes HD95/ASSD on the GPU (Dice always runs on CPU). It is
+  only used when CUDA is available and cuCIM and CuPy are installed
+  (e.g. `pip install cupy-cuda12x cucim-cu12` for CUDA 12); otherwise
+  `eval.py` prints why and evaluates on CPU. The device used is printed at
+  the start.
 - Produces two CSV files: `eval_metrics.csv` (one row per
   `(patient_id, class)`, with an `organ` column and
   `dice`/`hausdorff_distance_95`/`average_surface_distance` columns — every
