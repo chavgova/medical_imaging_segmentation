@@ -57,6 +57,52 @@ def dice(pred: np.ndarray, gt: np.ndarray, classes: Optional[Sequence[int]] = No
 
     return 2 * ious / (1 + ious)
 
+def confusion_matrix(gt: np.ndarray, pred: np.ndarray, n_classes: int = 5,
+                     spacing: Optional[Sequence[float]] = None) -> np.ndarray:
+    """
+    Voxel-wise confusion matrix: rows are ground-truth labels, columns are
+    predicted labels, so entry [i, j] is the number of voxels of true class i
+    predicted as class j.
+
+    Parameters
+    ----------
+    gt, pred:
+        Integer label maps of identical shape, with labels in [0, n_classes).
+        Note the (gt, pred) order, unlike the (pred, gt) of the other metrics.
+    n_classes:
+        Number of classes including background (5 for SegTHOR).
+    spacing:
+        Optional physical voxel size (e.g. (sx, sy, sz) in mm), one value per
+        axis of gt/pred.
+
+    Returns
+    -------
+    np.ndarray
+        (n_classes, n_classes) matrix of int64 voxel counts, or of float64
+        volumes in mm3 (counts x voxel volume) when spacing is given.
+    """
+    if gt.shape != pred.shape:
+        raise ValueError(f"gt and pred must have the same shape, got {gt.shape} and {pred.shape}")
+
+    gt = np.asarray(gt).astype(np.int64)
+    pred = np.asarray(pred).astype(np.int64)
+    for name, labels in (("gt", gt), ("pred", pred)):
+        if labels.size and (labels.min() < 0 or labels.max() >= n_classes):
+            raise ValueError(f"{name} labels must be in [0, {n_classes - 1}], "
+                             f"got values from {labels.min()} to {labels.max()}")
+
+    # each (gt, pred) pair maps to a unique bin n_classes * gt + pred
+    counts = np.bincount((n_classes * gt + pred).ravel(), minlength=n_classes ** 2)
+    counts = counts.reshape(n_classes, n_classes)
+
+    if spacing is None:
+        return counts
+
+    if len(spacing) != gt.ndim:
+        raise ValueError(f"spacing needs one value per axis ({gt.ndim}), got {tuple(spacing)}")
+
+    return counts * float(np.prod(spacing))
+
 def _to_monai(mask: np.ndarray, device: str) -> torch.Tensor:
     """Binary mask (X, Y, Z) -> MONAI's batch-first one-hot layout (1, 1, X, Y, Z), on `device`."""
     return torch.from_numpy(mask)[None, None].to(device)
