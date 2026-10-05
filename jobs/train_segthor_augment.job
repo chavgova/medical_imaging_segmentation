@@ -1,0 +1,19 @@
+#!/bin/bash
+#SBATCH --job-name=segthor_augment
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=04:00:00
+#SBATCH --account=gpuuva084
+#SBATCH --output=slurm_%j.out
+
+module load 2023
+module load Python/3.11.3-GCCcore-12.3.0
+
+cd ~/ai4mi_project
+source ai4mi/bin/activate
+
+# Same as baseline, +online augmentation (rotation + Gaussian noise, training-only).
+# Needs data/SEGTHOR already built (make data/SEGTHOR).
+python main.py --dataset SEGTHOR --mode full --epochs 25 \
+    --dest results/segthor/augment --gpu --augment

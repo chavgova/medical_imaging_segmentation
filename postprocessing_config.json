@@ -1,0 +1,48 @@
+{
+  "anatomy_aware_filtering": {
+    "connectivity": 26,
+    "classes": {
+      "1":{
+        "name": "esophagus",
+        "min_volume_mm3": 0.0,
+        "min_relative_volume": 0.05, 
+        "max_components": null,
+        "always_keep_largest": true
+      },
+      "2":{
+        "name": "heart", 
+        "min_volume_mm3": 0.0, 
+        "min_relative_volume": 0.05, 
+        "max_components": 1,
+        "always_keep_largest": true 
+      },
+      "3": {
+        "name": "trachea",
+        "min_volume_mm3": 0.0,
+        "min_relative_volume": 0.05,
+        "max_components": 1,
+        "always_keep_largest": true
+      },
+      "4": {
+        "name": "aorta",
+        "min_volume_mm3": 0.0,
+        "min_relative_volume": 0.05,
+        "max_components": 1,
+        "always_keep_largest": true
+      }
+    }
+  },
+  "dense_crf": {
+    "probability_pattern": "results/exp_L6_balance_normalized/results/probability_volumes/{id_}.nii.gz",
+    "image_pattern": "data/segthor_part1/train/{id_}/{id_}.nii.gz",
+    "iterations": 5, 
+    "probability_epsilon": 1e-6,
+    "spatial_sigma_mm": [3.0,3.0, 3.0],
+    "spatial_weight": 3.0,
+    "bilateral_spatial_sigma_mm": [17.0 , 12.0, 10.0],
+    "bilateral_intensity_sigma_hu": 50.0,  
+    "bilateral_weight": 5.0,  
+    "roi_foreground_probability": 0.5,
+    "roi_margin_mm": 20.0   
+  }
+}

@@ -8,3 +8,6 @@ scikit-image
 scipy
 matplotlib
 monai
+pydensecrf2==1.1
+torchio>=0.20,<1
+transformers>=4.56

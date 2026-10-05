@@ -1,0 +1,28 @@
+#!/bin/bash
+#SBATCH --job-name=segthor_hu
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=04:00:00
+#SBATCH --account=gpuuva084
+#SBATCH --output=slurm_%j.out
+
+# Prerequisite (run once on the login node first, it's CPU-only -- don't waste GPU
+# budget slicing data inside this job):
+#   python slice_segthor.py --source_dir data/segthor_part1 --dest_dir data/SEGTHOR_hu \
+#       --shape 256 256 --retains 5 --hu_min -1000 --hu_max 300 -p -1
+
+module load 2023
+module load Python/3.11.3-GCCcore-12.3.0
+
+cd ~/ai4mi_project
+source ai4mi/bin/activate
+
+if [ ! -d data/SEGTHOR_hu ]; then
+    echo "data/SEGTHOR_hu missing -- run the slice_segthor.py command in the header comment first." >&2
+    exit 1
+fi
+
+# Same as baseline, but trained on the HU-windowed (-1000/300) preprocessed data.
+python main.py --dataset SEGTHOR --mode full --epochs 25 \
+    --dest results/segthor/hu --gpu --data_dir data/SEGTHOR_hu

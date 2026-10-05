@@ -190,7 +190,8 @@ are missing.
   the start.
 - `--confusion_matrix` also saves voxel-count confusion matrices (rows =
   ground truth, columns = prediction, size `--num_classes`, or the number of
-  `--class_names` if omitted): `eval_metrics_confusion_matrix.npz`, mapping
+  `--class_names` if omitted), computed on exactly the predictions that are
+  scored, i.e. after any `--postprocessing`: `eval_metrics_confusion_matrix.npz`, mapping
   each patient id to its `(K, K)` matrix (the readme's `.npz` submission
   format; load with `np.load(path)["Patient_01"]`), and
   `eval_metrics_confusion_matrix.png`, a heatmap of the matrix summed over

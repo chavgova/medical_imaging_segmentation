@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name=smoke_test
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=00:15:00
+#SBATCH --account=gpuuva084
+#SBATCH --output=slurm_%j.out
+
+module load 2023
+module load Python/3.11.3-GCCcore-12.3.0
+
+cd ~/ai4mi_project
+source ai4mi/bin/activate
+
+# Fast 2-patient/1-epoch sanity check of the full pipeline before committing to a real run.
+python main.py --test_pipeline --gpu

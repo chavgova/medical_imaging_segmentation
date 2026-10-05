@@ -3,8 +3,10 @@
 import argparse
 import csv
 import importlib.util
+import json
+from functools import partial
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import nibabel as nib
@@ -22,6 +24,41 @@ BACKGROUND_CLASS = 0
 
 # SegTHOR label convention: class index -> organ name
 SEGTHOR_CLASS_NAMES = ["background", "esophagus", "heart", "trachea", "aorta"]
+
+from postprocessing import (anatomy_aware_filtering, closing, dense_crf, fill_holes,
+                            keep_largest_connected_components, opening,
+                            salt_and_pepper)
+
+# Add future techniques here; each callable takes and returns a 3D label map.
+POSTPROCESSORS = {
+    "largest_connected_components": keep_largest_connected_components,
+    "fill_holes": fill_holes,
+    "opening": opening,
+    "closing": closing,
+    "salt_and_pepper": salt_and_pepper,
+}
+CONFIGURED_POSTPROCESSORS = {"anatomy_aware_filtering": anatomy_aware_filtering, "dense_crf": dense_crf}
+POSTPROCESSOR_NAMES = [*POSTPROCESSORS, *CONFIGURED_POSTPROCESSORS]
+
+class PostprocessingPipeline:
+    """applies ordered post-processing steps with per-patient spatial context"""
+
+    def __init__(self, steps: Sequence[tuple[Callable, Sequence[str]]],
+                 probability_pattern: Optional[str] = None,
+                 image_pattern: Optional[str] = None):
+        self.steps = list(steps)
+        self.probability_pattern = probability_pattern
+        self.image_pattern = image_pattern
+
+    def __call__(self, volume: np.ndarray, spacing: Sequence[float],
+                 probabilities: Optional[np.ndarray] = None,
+                 image: Optional[np.ndarray] = None) -> np.ndarray:
+        result = volume
+        context = {"spacing": spacing, "probabilities": probabilities, "image": image}
+        for processor, context_names in self.steps:
+            kwargs = {name: context[name] for name in context_names}
+            result = processor(result, **kwargs)
+        return result
 
 # such that all metrics have same signature: (pred, gt, spacing, c, device)
 def _dice_c(pred: np.ndarray, gt: np.ndarray, spacing, c: int = 1, device: str = "cpu") -> float:
@@ -51,7 +88,7 @@ def get_device(gpu: bool) -> str:
 
 
 def load_volume(path: Path) -> np.ndarray:
-    """Load a 3D label-map volume from a .nii.gz file as a numpy array."""
+    """gets a NIfTI array from a .nii.gz file"""
     return np.asarray(nib.load(str(path)).dataobj)
 
 
@@ -77,16 +114,28 @@ def discover_classes(gt_paths: Sequence[Path]) -> list[int]:
 
     return sorted(classes)
 
-
 def class_name(c: int, class_names: Sequence[str]) -> str:
     # Fall back to the class index for labels without a name.
     return class_names[c] if c < len(class_names) else str(c)
 
-
 def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: Sequence[int], metrics: Sequence[str] = None,
-                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES, device: str = "cpu") -> list[dict]:
+                     postprocess: Optional[Callable[[np.ndarray], np.ndarray] | PostprocessingPipeline] = None,
+                     save_folder: Optional[Path] = None,
+                     probability_path: Optional[Path] = None,
+                     image_path: Optional[Path] = None,
+                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES, device: str = "cpu",
+                     confusion_classes: Optional[int] = None) -> tuple[list[dict], Optional[np.ndarray]]:
 
-    pred_vol = load_volume(pred_path)
+    save_path = None
+    if save_folder is not None:
+        save_path = Path(save_folder) / pred_path.name
+        for source in (pred_path, gt_path):
+            if (save_path.resolve() == source.resolve()
+                    or (save_path.exists() and save_path.samefile(source))):
+                raise ValueError(f"Cannot overwrite an input volume: {save_path}")
+
+    pred_image = nib.load(str(pred_path))
+    pred_vol = np.asarray(pred_image.dataobj)
     gt_vol = load_volume(gt_path)
 
     assert pred_vol.shape == gt_vol.shape, (
@@ -95,6 +144,14 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
     )
 
     spacing = nib.load(str(gt_path)).header.get_zooms()[:3]
+
+    if postprocess is not None:
+        if isinstance(postprocess, PostprocessingPipeline):
+            probabilities = load_volume(probability_path) if probability_path is not None else None
+            image = load_volume(image_path) if image_path is not None else None   
+            pred_vol = postprocess(pred_vol, spacing, probabilities, image)
+        else: 
+            pred_vol = postprocess(pred_vol)
 
     if metrics is None:
         metrics = ["dice", "hausdorff_distance_95", "average_surface_distance"]
@@ -108,12 +165,30 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
             row[metric] = METRIC_FUNCS[metric](pred_vol, gt_vol, spacing, c=c, device=device)
         rows.append(row)
 
-    return rows
+    if save_path is not None:
+        # Keep prediction geometry; filtering does not resample or align voxels.
+        saved_image = pred_image.__class__(pred_vol, pred_image.affine, header=pred_image.header.copy())
+        saved_image.set_qform(*pred_image.get_qform(coded=True))
+        saved_image.set_sform(*pred_image.get_sform(coded=True))
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        nib.save(saved_image, str(save_path))
+
+    # From the same (post-processed) prediction the metrics above were computed on
+    matrix = None
+    if confusion_classes is not None:
+        matrix = confusion_matrix(gt_vol, pred_vol, n_classes=confusion_classes)
+
+    return rows, matrix
 
 
 
-def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[int] = None, metrics: Sequence[str] = None,
-                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES, device: str = "cpu") -> list[dict]:
+
+def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[int] = None, metrics: Sequence[str] = None, class_names: Sequence[str] = SEGTHOR_CLASS_NAMES, device: str = "cpu", postprocess: Optional[Callable[[np.ndarray], np.ndarray] | PostprocessingPipeline] = None, save_folder: Optional[Path] = None,
+                     confusion_classes: Optional[int] = None) -> tuple[list[dict], dict[str, np.ndarray]]:
+    """
+    Scores every patient. With confusion_classes set, also returns each patient's
+    (confusion_classes, confusion_classes) confusion matrix, keyed by patient id.
+    """
 
     patient_ids = match_patients(pred_folder, gt_pattern)
 
@@ -124,24 +199,28 @@ def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[i
         classes = list(range(num_classes))
 
     rows: list[dict] = []
-    for pid in tqdm_(patient_ids):
-        pred_path = pred_folder / f"{pid}.nii.gz"
+    matrices: dict[str, np.ndarray] = {}
+    for pid in tqdm_(patient_ids):  
+        pred_path = pred_folder/ f"{pid}.nii.gz" 
         gt_path = Path(gt_pattern.format(id_=pid))
-        rows.extend(evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics, class_names=class_names,
-                                     device=device))
+        probability_path = None
+        image_path = None 
+        
+        if isinstance(postprocess, PostprocessingPipeline): 
+            if postprocess.probability_pattern is not None: 
+                probability_path = Path(postprocess.probability_pattern.format(id_=pid))
+            if postprocess.image_pattern is not None:
+                image_path = Path(postprocess.image_pattern.format(id_=pid))
+        patient_rows, matrix = evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics,
+                                                class_names=class_names, device=device,
+                                                postprocess=postprocess, save_folder=save_folder,
+                                                probability_path=probability_path, image_path=image_path,
+                                                confusion_classes=confusion_classes)
+        rows.extend(patient_rows)
+        if matrix is not None:
+            matrices[pid] = matrix
 
-    return rows
-
-
-def evaluate_confusion_matrices(pred_folder: Path, gt_pattern: str, n_classes: int) -> dict[str, np.ndarray]:
-    """Per-patient voxel-count confusion matrices, rows = ground truth, columns = prediction."""
-    matrices = {}
-    for pid in tqdm_(match_patients(pred_folder, gt_pattern)):
-        gt_vol = load_volume(Path(gt_pattern.format(id_=pid)))
-        pred_vol = load_volume(pred_folder / f"{pid}.nii.gz")
-        matrices[pid] = confusion_matrix(gt_vol, pred_vol, n_classes=n_classes)
-
-    return matrices
+    return rows, matrices
 
 
 def plot_confusion_matrix(matrix: np.ndarray, names: Sequence[str], path: Path) -> None:
@@ -255,11 +334,65 @@ def print_summary(summary: Sequence[dict], metrics: Sequence[str]) -> None:
                   f" (NaN: {row[f'{metric}_nan_count']})")
 
 
+def build_postprocessing_pipeline(args: argparse.Namespace) -> Optional[PostprocessingPipeline]:
+    if args.postprocessing == ["none"]:
+        return None
+
+    configured = {}
+    configured_names = set(args.postprocessing) & set(CONFIGURED_POSTPROCESSORS)
+    if configured_names:
+        try:
+            with open(args.postprocessing_config) as config_file:
+                root_config = json.load(config_file)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Cannot load post-processing config {args.postprocessing_config}: {error}") from error
+        configured = {name: root_config[name] for name in configured_names}
+
+    steps: list[tuple[Callable, Sequence[str]]] = []
+    for method in args.postprocessing:
+        if method == "anatomy_aware_filtering":
+            processor = partial(anatomy_aware_filtering, config=configured[method])
+            steps.append((processor, ("spacing",)))
+            continue
+        if method == "dense_crf":
+            processor = partial(dense_crf, config=configured[method])
+            steps.append((processor, ("probabilities", "image", "spacing")))
+            continue
+
+        options = {"classes": args.postprocessing_classes}
+        if args.connectivity is not None and method != "salt_and_pepper":
+            options["connectivity"] = args.connectivity
+        if method == "largest_connected_components":
+            options["k"] = args.top_k
+        if method in ("opening", "closing"):
+            options["iterations"] = args.iterations
+        if method == "salt_and_pepper":
+            options["kernel_size"] = args.kernel_size
+        steps.append((partial(POSTPROCESSORS[method], **options), ()))
+
+    dense_config = configured.get("dense_crf", {})
+    return PostprocessingPipeline(
+        steps,
+        probability_pattern=dense_config.get("probability_pattern"),
+        image_pattern=dense_config.get("image_pattern"),
+    )
+
+
 def main(args: argparse.Namespace) -> None:
     device = get_device(args.gpu)
     print(f">> Evaluating on {device}")
-    rows = evaluate_dataset(args.pred_folder, args.gt_pattern, args.num_classes, args.metrics, args.class_names,
-                            device)
+    
+    postprocess = build_postprocessing_pipeline(args)
+    save_folder = None
+    if args.save:
+        save_folder = args.save_folder or args.dest.parent / f"{args.dest.stem}_volumes"
+    confusion_classes = (args.num_classes or len(args.class_names)) if args.confusion_matrix else None
+    rows, matrices = evaluate_dataset(args.pred_folder, args.gt_pattern, args.num_classes, args.metrics,
+                                      class_names=args.class_names, device=device,
+                                      postprocess=postprocess, save_folder=save_folder,
+                                      confusion_classes=confusion_classes)
+    if save_folder is not None:
+        print(f"Saved evaluated prediction volumes to {save_folder}")
 
     dest: Path = args.dest
     summary_dest = dest.with_name(f"{dest.stem}_summary{dest.suffix}")
@@ -274,8 +407,6 @@ def main(args: argparse.Namespace) -> None:
     print_summary(summary, args.metrics)
 
     if args.confusion_matrix:
-        n_classes = args.num_classes or len(args.class_names)
-        matrices = evaluate_confusion_matrices(args.pred_folder, args.gt_pattern, n_classes)
         npz_dest, png_dest = save_confusion_matrices(matrices, args.class_names, dest)
         print(f"Saved per-patient confusion matrices to {npz_dest}")
         print(f"Saved plot of the confusion matrix summed over patients to {png_dest}")
@@ -307,12 +438,51 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--confusion_matrix", action="store_true",
                         help="Also save voxel-count confusion matrices (rows = ground truth, columns = "
                              "prediction): <dest>_confusion_matrix.npz with one matrix per patient id, and "
-                             "<dest>_confusion_matrix.png, a plot of the matrix summed over all patients.")
+                             "<dest>_confusion_matrix.png, a plot of the matrix summed over all patients. "
+                             "Computed on the same (post-processed) predictions as the metrics.")
+    parser.add_argument("--postprocessing", choices=["none", *POSTPROCESSOR_NAMES], nargs="+", default=["none"],
+                        help="Ordered techniques applied in memory before scoring (default: none)")
+    parser.add_argument("--postprocessing_config", type=Path,
+                        default=Path(__file__).with_name("postprocessing_config.json"),
+                        help="JSON inputs and parameters for anatomy_aware_filtering and dense_crf")
+    parser.add_argument("--top_k", type=int, default=1,
+                        help="Number of components per class for largest_connected_components only (default: 1).")
+    parser.add_argument("--connectivity", type=int, choices=[6, 18, 26], default=None,
+                        help="3D neighborhood / morphology structuring element. "
+                             "Defaults: 26 for largest_connected_components, 6 for fill_holes/opening/closing.")
+    parser.add_argument("--iterations", type=int, default=1,
+                        help="Positive number of erosion/dilation steps per stage for opening/closing only (default: 1).")
+    parser.add_argument("--kernel_size", type=int, default=3,
+                        help="Odd positive cubic window width for salt_and_pepper only (default: 3 voxels).")
+    parser.add_argument("--postprocessing_classes", type=int, nargs="+", default=None,
+                        help="Labels to filter; defaults to all nonzero prediction labels.")
+    parser.add_argument("--save", action="store_true",
+                        help="Save evaluated predictions as .nii.gz files after optional post-processing.")
+    parser.add_argument("--save_folder", type=Path, default=None,
+                        help="Output volume folder (requires --save). Default: <dest stem>_volumes "
+                             "beside the results CSV. Existing output files are replaced.")
     parser.add_argument("--dest", type=Path, required=True,
                         help="Output path for the per-patient-per-class results CSV. "
                              "The per-class summary is saved alongside it as <dest>_summary.csv")
 
     args = parser.parse_args()
+
+    if args.top_k < 1:
+        parser.error("--top_k must be a positive integer")
+    if args.iterations < 1:
+        parser.error("--iterations must be a positive integer")
+    if args.kernel_size < 1 or args.kernel_size % 2 == 0:
+        parser.error("--kernel_size must be a positive odd integer")
+    if "none" in args.postprocessing and args.postprocessing != ["none"]:
+        parser.error("--postprocessing none cannot be combined with another method")
+    if len(args.postprocessing) != len(set(args.postprocessing)):
+        parser.error("--postprocessing methods cannot be repeated")
+    if "dense_crf" in args.postprocessing and args.postprocessing[0] != "dense_crf":
+        parser.error("dense_crf must be the first post-processing method")
+    if args.postprocessing == ["salt_and_pepper"] and args.connectivity is not None:
+        parser.error("salt_and_pepper uses --kernel_size, not --connectivity")
+    if args.save_folder is not None and not args.save:
+        parser.error("--save_folder requires --save")
 
     print(args)
 

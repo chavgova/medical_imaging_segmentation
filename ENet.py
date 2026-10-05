@@ -178,13 +178,17 @@ class ENet(nn.Module):
                 F: int = kwargs["factor"] if "factor" in kwargs else 4  # Projecting factor
                 K: int = kwargs["kernels"] if "kernels" in kwargs else 16  # n_kernels
 
+                if not 0 < in_dim < K:
+                        raise ValueError(f"ENet requires 0 < in_dim < kernels, got {in_dim=} and {K=}")
+
                 # from models.enet import (BottleNeck,
                 #                          BottleNeckDownSampling,
                 #                          BottleNeckUpSampling,
                 #                          conv_block)
 
                 # Initial operations
-                self.conv0 = nn.Conv2d(in_dim, K - 1, kernel_size=3, stride=2, padding=1)
+                # The convolution output and pooled input are concatenated to K channels.
+                self.conv0 = nn.Conv2d(in_dim, K - in_dim, kernel_size=3, stride=2, padding=1)
                 self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
 
                 # Downsampling half

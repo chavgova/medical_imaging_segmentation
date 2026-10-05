@@ -1,0 +1,34 @@
+#!/bin/bash
+# PARKED -- do not run yet. --target_spacing + center-crop to --shape 256x256 was found to
+# discard 70-87% of the imaged cross-sectional area for every patient (crop keeps only a
+# ~250mm-wide central window out of a ~500mm-wide chest CT slice), risking clipping the
+# target organs. Needs either a validation check (do organ masks stay inside the crop for
+# every patient?) or a larger --shape, before this is safe to actually train with.
+#SBATCH --job-name=segthor_spacing
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=04:00:00
+#SBATCH --account=gpuuva084
+#SBATCH --output=slurm_%j.out
+
+# Prerequisite (run once on the login node first, it's CPU-only -- don't waste GPU
+# budget slicing data inside this job). 0.9766mm is the median in-plane spacing
+# across the training patients (see preprocessing_params.ipynb), not an arbitrary pick:
+#   python slice_segthor.py --source_dir data/segthor_part1 --dest_dir data/SEGTHOR_spacing \
+#       --shape 256 256 --retains 5 --target_spacing 0.9766 -p -1
+
+module load 2023
+module load Python/3.11.3-GCCcore-12.3.0
+
+cd ~/ai4mi_project
+source ai4mi/bin/activate
+
+if [ ! -d data/SEGTHOR_spacing ]; then
+    echo "data/SEGTHOR_spacing missing -- run the slice_segthor.py command in the header comment first." >&2
+    exit 1
+fi
+
+# Same as baseline, but trained on the spacing-normalized preprocessed data.
+python main.py --dataset SEGTHOR --mode full --epochs 25 \
+    --dest results/segthor/spacing --gpu --data_dir data/SEGTHOR_spacing

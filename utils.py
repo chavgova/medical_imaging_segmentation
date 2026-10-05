@@ -27,12 +27,18 @@ from functools import partial
 from multiprocessing import Pool
 from contextlib import AbstractContextManager
 from typing import Callable, Iterable, List, Set, Tuple, TypeVar, cast
+import copy
+import json
 
 import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from torch import Tensor, einsum
+from torch import nn
+from torch.profiler import profile, ProfilerActivity
+from torch.utils.flop_counter import FlopCounterMode
+import torch.nn.functional as F
 
 tqdm_ = partial(tqdm, dynamic_ncols=True,
                 leave=True,
@@ -176,3 +182,109 @@ def union(a: Tensor, b: Tensor) -> Tensor:
     assert sset(res, [0, 1])
 
     return res
+
+
+# FLOPs profiling
+FLOPS_PROFILE_BATCHES = 10 
+
+def _profiler_activities(device: torch.device) -> list[ProfilerActivity]:
+    activities = [ProfilerActivity.CPU] 
+    if device.type == "cuda": 
+        activities.append(ProfilerActivity.CUDA)
+
+    return activities  
+
+
+def _profiler_flops(prof) -> int:
+    total=0 
+    for event in prof.key_averages():
+        if event.flops is not None: 
+            total += event.flops
+
+    return int(total)
+
+
+def _profile_train_batch(net: nn.Module,optimizer, loss_fn,img: Tensor, gt: Tensor, device: torch.device) -> int:
+    net.train() 
+
+    with profile(activities=_profiler_activities(device), with_flops=True) as prof:
+        optimizer.zero_grad() 
+        pred_logits = net(img) 
+        pred_probs = F.softmax(pred_logits, dim=1)
+        loss = loss_fn(pred_probs, gt)
+        loss.backward()
+        optimizer.step()
+
+    return _profiler_flops(prof)
+
+
+def _profile_train_batch_with_backprop(net: nn.Module, optimizer, loss_fn, img: Tensor, gt: Tensor, device: torch.device) -> int:
+    """torch profiler doesn't include backpropagation, this does."""
+    net.train()
+
+    with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+        with FlopCounterMode(display=False) as counter:
+            optimizer.zero_grad()
+            pred_logits = net(img)
+            pred_probs = F.softmax(pred_logits, dim=1)
+            loss = loss_fn(pred_probs, gt)
+            loss.backward()
+            optimizer.step()
+
+    return counter.get_total_flops()
+
+
+def _profile_val_batch(net: nn.Module, img: Tensor, device: torch.device) -> int:
+    net.eval()
+
+    with profile(activities=_profiler_activities(device), with_flops=True) as prof:
+        with torch.no_grad():
+            pred_logits = net(img) 
+            bla = F.softmax(pred_logits, dim=1) 
+
+    return _profiler_flops(prof)
+
+
+def estimate_flops(net: nn.Module, optimizer, loss_fn, train_loader, val_loader, device: torch.device) -> dict:
+    initial_state = copy.deepcopy(net.state_dict())
+
+    train_sample_flops: list[float] = []
+    train_sample_flops_with_backprop: list[float] = []
+    for i, data in enumerate(train_loader):
+        if i >= FLOPS_PROFILE_BATCHES:
+            break
+
+        img = data["images"].to(device)
+        gt = data["gts"].to(device)
+
+        flops = _profile_train_batch(net, optimizer, loss_fn, img, gt, device)
+        train_sample_flops.append(flops / img.shape[0])
+
+        flops = _profile_train_batch_with_backprop(net, optimizer, loss_fn, img, gt, device)
+        train_sample_flops_with_backprop.append(flops / img.shape[0])
+
+    val_sample_flops: list[float] = []
+    for i, data in enumerate(val_loader):
+        if i >= FLOPS_PROFILE_BATCHES:
+            break
+
+        img = data["images"].to(device)
+
+        flops = _profile_val_batch(net, img, device)
+        val_sample_flops.append(flops / img.shape[0])
+
+    net.load_state_dict(initial_state)
+    del initial_state  
+    optimizer.state.clear()
+
+    return {
+        "flops_per_train_sample": float(np.mean(train_sample_flops)) if train_sample_flops else None,
+        "flops_per_train_sample_with_backprop": float(np.mean(train_sample_flops_with_backprop)) if train_sample_flops_with_backprop else None,
+        "flops_per_val_sample": float(np.mean(val_sample_flops)) if val_sample_flops else None
+    }
+
+
+def save_flops_count(dest: Path, flops_count: dict) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    with open(dest / "flops_count.json", "w") as f:
+        json.dump(flops_count, f, indent=2, sort_keys=True)
