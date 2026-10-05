@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
-# Dataset-independent segmentation evaluation metrics: IoU, Dice, HD95, ASD.
+# Dataset-independent segmentation evaluation metrics: IoU, Dice, HD95, ASD,
+# and a voxel-wise confusion matrix.
 
 # Every function takes plain numpy label maps (not one-hot, not torch tensors)
-# and a class value to score, so they work the same way for a 2-class (binary)
-# problem or an N-class one, on any dataset.
+# and a class value to score (confusion_matrix covers all classes at once), so
+# they work the same way for a 2-class (binary) problem or an N-class one, on
+# any dataset.
 # HD95 and ASD are computed by MONAI (monai.metrics); the wrappers here only
 # convert the inputs and apply our empty-mask conventions.
 
