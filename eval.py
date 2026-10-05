@@ -2,11 +2,13 @@
 
 import argparse
 import csv
+import importlib.util
 from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
 import nibabel as nib
+import torch
 
 from utils import tqdm_
 from metrics import dice, hausdorff_distance_95, average_surface_distance
@@ -16,8 +18,8 @@ BACKGROUND_CLASS = 0
 # SegTHOR label convention: class index -> organ name
 SEGTHOR_CLASS_NAMES = ["background", "esophagus", "heart", "trachea", "aorta"]
 
-# such that all metrics have same signature: (pred, gt, spacing, c)
-def _dice_c(pred: np.ndarray, gt: np.ndarray, spacing, c: int = 1) -> float:
+# such that all metrics have same signature: (pred, gt, spacing, c, device)
+def _dice_c(pred: np.ndarray, gt: np.ndarray, spacing, c: int = 1, device: str = "cpu") -> float:
     return float(dice(pred, gt, classes=[c])[0])
 
 
@@ -26,6 +28,21 @@ METRIC_FUNCS = {
     "hausdorff_distance_95": hausdorff_distance_95,
     "average_surface_distance": average_surface_distance,
 }
+
+
+def get_device(gpu: bool) -> str:
+    """'cuda' if asked for and usable, else 'cpu'."""
+    if not gpu:
+        return "cpu"
+    if not torch.cuda.is_available():
+        print(">> --gpu given but CUDA is not available, evaluating on CPU")
+        return "cpu"
+    # Without cuCIM, MONAI computes the surface distances of CUDA tensors with SciPy on
+    # CPU, which is slower than its CPU path.
+    if importlib.util.find_spec("cucim") is None or importlib.util.find_spec("cupy") is None:
+        print(">> --gpu given but cuCIM/CuPy is not installed, evaluating on CPU")
+        return "cpu"
+    return "cuda"
 
 
 def load_volume(path: Path) -> np.ndarray:
@@ -62,7 +79,7 @@ def class_name(c: int, class_names: Sequence[str]) -> str:
 
 
 def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: Sequence[int], metrics: Sequence[str] = None,
-                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES) -> list[dict]:
+                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES, device: str = "cpu") -> list[dict]:
 
     pred_vol = load_volume(pred_path)
     gt_vol = load_volume(gt_path)
@@ -83,7 +100,7 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
             continue
         row = {"patient_id": patient_id, "class": c, "organ": class_name(c, class_names)}
         for metric in metrics:
-            row[metric] = METRIC_FUNCS[metric](pred_vol, gt_vol, spacing, c=c)
+            row[metric] = METRIC_FUNCS[metric](pred_vol, gt_vol, spacing, c=c, device=device)
         rows.append(row)
 
     return rows
@@ -91,7 +108,7 @@ def evaluate_patient(patient_id: str, pred_path: Path, gt_path: Path, classes: S
 
 
 def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[int] = None, metrics: Sequence[str] = None,
-                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES) -> list[dict]:
+                     class_names: Sequence[str] = SEGTHOR_CLASS_NAMES, device: str = "cpu") -> list[dict]:
 
     patient_ids = match_patients(pred_folder, gt_pattern)
 
@@ -105,7 +122,8 @@ def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[i
     for pid in tqdm_(patient_ids):
         pred_path = pred_folder / f"{pid}.nii.gz"
         gt_path = Path(gt_pattern.format(id_=pid))
-        rows.extend(evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics, class_names=class_names))
+        rows.extend(evaluate_patient(pid, pred_path, gt_path, classes, metrics=metrics, class_names=class_names,
+                                     device=device))
 
     return rows
 
@@ -149,7 +167,10 @@ def print_summary(summary: Sequence[dict], metrics: Sequence[str]) -> None:
 
 
 def main(args: argparse.Namespace) -> None:
-    rows = evaluate_dataset(args.pred_folder, args.gt_pattern, args.num_classes, args.metrics, args.class_names)
+    device = get_device(args.gpu)
+    print(f">> Evaluating on {device}")
+    rows = evaluate_dataset(args.pred_folder, args.gt_pattern, args.num_classes, args.metrics, args.class_names,
+                            device)
 
     dest: Path = args.dest
     summary_dest = dest.with_name(f"{dest.stem}_summary{dest.suffix}")
@@ -184,6 +205,9 @@ def get_args() -> argparse.Namespace:
                         help="Organ name for each class index, starting with background (same convention "
                              "as viewer.py). Defaults to the SegTHOR labels: "
                              + " ".join(SEGTHOR_CLASS_NAMES) + ".")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Compute HD95/ASSD on the GPU. Needs CUDA plus cuCIM and CuPy; "
+                             "falls back to CPU otherwise. Dice always runs on CPU.")
     parser.add_argument("--dest", type=Path, required=True,
                         help="Output path for the per-patient-per-class results CSV. "
                              "The per-class summary is saved alongside it as <dest>_summary.csv")
