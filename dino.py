@@ -36,18 +36,20 @@ from transformers import AutoModel
 # is MedDINOv3: the ViT-B/16 trained further on 3.87M CT slices (CT-3M).
 Dino = Literal["dinov3-vits16", "dinov3-vitb16", "meddinov3-vitb16"]
 
-# The HU window of our exp_P1_HU data (slice_segthor.py --hu_min -1000 --hu_max 300),
-# which stores it as 0 to 1. Only for MedDINOv3, which normalizes the raw HU values,
-# so these turn our inputs back into HU. DINOv3 takes the 0 to 1 values as they are.
-HU_MIN, HU_MAX = -1000, 300
-
-
 class FrozenDino(nn.Module):
-    def __init__(self, dino: Dino, upsample: int = 1):
+    def __init__(self, dino: Dino, upsample: int = 1, hu_window: tuple[float, float] | None = None,
+                 context_slices: int = 0, n_windows: int = 1):
         super().__init__()
         assert dino in get_args(Dino), f"unknown dino {dino!r}"
         assert upsample in (1, 2, 4), "upsample must be 1, 2 or 4"
+        assert (
+            dino != "meddinov3-vitb16" or hu_window is not None
+        ), "MedDINOv3 needs data with a fixed HU window (--hu_min/--hu_max or --hu_windows)"
+        assert context_slices >= 0 and n_windows >= 1
         self.dino: Dino = dino
+        self.hu_window: tuple[float, float] | None = hu_window
+        self.context_slices: int = context_slices
+        self.n_windows: int = n_windows
         match dino:
             # Note that you need Hugging Face authentication and authorization to use these.
             case "dinov3-vits16" | "dinov3-vitb16":
@@ -113,8 +115,8 @@ class FrozenDino(nn.Module):
             not self.training and not self.model.training
         ), "FrozenDino must stay in eval mode"
         assert (
-            x.dim() == 4 and x.size(1) % 2 == 1
-        ), f"expected (B, 2 * context_slices + 1, H, W), got {tuple(x.shape)}"
+            x.dim() == 4 and x.size(1) == (2 * self.context_slices + 1) * self.n_windows
+        ), f"expected (B, (2 * context_slices + 1) * n_windows, H, W), got {tuple(x.shape)}"
         batch, _, height, width = x.shape
         assert (
             height % self.patch_size == 0 and width % self.patch_size == 0
@@ -123,7 +125,7 @@ class FrozenDino(nn.Module):
             x.min() >= 0 and x.max() <= 1
         ), "expected images scaled to [0, 1] (our PNGs divided by 255)"
         grid = (height // self.patch_size, width // self.patch_size)
-        center = x.size(1) // 2  # the middle slice with --context_slices
+        center = self.context_slices  # the middle slice of window 0
         image = x[:, center : center + 1]
         if self.upsample > 1:
             image = F.interpolate(
@@ -146,7 +148,9 @@ class FrozenDino(nn.Module):
                 # The normalize() of MedDINOv3's inference/demo.ipynb: HU clamped
                 # to [-1000, 1000], then (HU - mean) / std, repeated to 3 channels
                 case "meddinov3-vitb16":
-                    hu = (HU_MIN + (HU_MAX - HU_MIN) * image).clamp(-1000, 1000)
+                    assert self.hu_window is not None
+                    hu_min, hu_max = self.hu_window
+                    hu = (hu_min + (hu_max - hu_min) * image).clamp(-1000, 1000)
                     rgb = ((hu - 65.1084213256836) / 178.01663208007812).expand(
                         -1, 3, -1, -1
                     )
