@@ -57,12 +57,12 @@ def dice(pred: np.ndarray, gt: np.ndarray, classes: Optional[Sequence[int]] = No
 
     return 2 * ious / (1 + ious)
 
-def _to_monai(mask: np.ndarray) -> torch.Tensor:
-    """Binary mask (X, Y, Z) -> MONAI's batch-first one-hot layout (1, 1, X, Y, Z)."""
-    return torch.from_numpy(mask)[None, None]
+def _to_monai(mask: np.ndarray, device: str) -> torch.Tensor:
+    """Binary mask (X, Y, Z) -> MONAI's batch-first one-hot layout (1, 1, X, Y, Z), on `device`."""
+    return torch.from_numpy(mask)[None, None].to(device)
 
 
-def hausdorff_distance_95(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[float], c: int = 1) -> float:
+def hausdorff_distance_95(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[float], c: int = 1, device: str = "cpu") -> float:
     """
 
     Parameters
@@ -74,6 +74,10 @@ def hausdorff_distance_95(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[fl
         pred/gt.
     c:
         The class value to score.
+    device:
+        Where MONAI computes the distances. On "cuda" it uses cuCIM's GPU
+        erosion and distance transform, so cuCIM and CuPy must be installed
+        (without them MONAI falls back to SciPy on CPU, slower than "cpu").
 
     Returns
     -------
@@ -96,12 +100,11 @@ def hausdorff_distance_95(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[fl
         return float("nan")
 
     # the single channel is the class being scored, so it must not be dropped as background
-    hd95 = compute_hausdorff_distance(_to_monai(pred_mask), _to_monai(gt_mask), include_background=True,
-                                      percentile=95, directed=False, spacing=tuple(map(float, spacing)))
+    hd95 = compute_hausdorff_distance(_to_monai(pred_mask, device), _to_monai(gt_mask, device), include_background=True, percentile=95, directed=False, spacing=tuple(map(float, spacing)))
 
     return float(hd95[0, 0])
 
-def average_surface_distance(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[float], c: int = 1) -> float:
+def average_surface_distance(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[float], c: int = 1, device: str = "cpu") -> float:
     """
 
     Parameters
@@ -113,6 +116,10 @@ def average_surface_distance(pred: np.ndarray, gt: np.ndarray, spacing: Sequence
         pred/gt
     c:
         The class value to score.
+    device:
+        Where MONAI computes the distances. On "cuda" it uses cuCIM's GPU
+        erosion and distance transform, so cuCIM and CuPy must be installed
+        (without them MONAI falls back to SciPy on CPU, slower than "cpu").
 
     Returns
     -------
@@ -133,8 +140,7 @@ def average_surface_distance(pred: np.ndarray, gt: np.ndarray, spacing: Sequence
         return float("nan")
 
     # symmetric=True: MONAI defaults to the directed pred->gt distance only
-    asd = compute_average_surface_distance(_to_monai(pred_mask), _to_monai(gt_mask), include_background=True,
-                                           symmetric=True, spacing=tuple(map(float, spacing)))
+    asd = compute_average_surface_distance(_to_monai(pred_mask, device), _to_monai(gt_mask, device), include_background=True, symmetric=True, spacing=tuple(map(float, spacing)))
 
     return float(asd[0, 0])
 
