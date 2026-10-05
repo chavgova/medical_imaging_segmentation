@@ -168,8 +168,11 @@ are missing.
   `dice`/`hausdorff_distance_95`/`average_surface_distance` columns — every
   individual score), and `eval_metrics_summary.csv` (one row per organ, with
   `..._mean`/`..._std` columns, aggregated across patients with
-  `np.nanmean`/`np.nanstd`). The summary is also printed to stdout, one block
-  per organ.
+  `np.nanmean`/`np.nanstd`, and a `..._nan_count` column giving how many
+  patients were NaN for that metric and therefore left out of the mean/std —
+  for HD95/ASSD, the patients where the organ was missed or falsely
+  predicted). The summary is also printed to stdout, one block per organ,
+  with the NaN count next to each metric.
 - Error messages if a patient's ground truth
   can't be found via `gt_pattern`, or if a patient's prediction and
   ground-truth volumes have different shapes.
