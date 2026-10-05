@@ -10,8 +10,13 @@ import numpy as np
 import nibabel as nib
 import torch
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
 from utils import tqdm_
-from metrics import dice, hausdorff_distance_95, average_surface_distance
+from metrics import confusion_matrix, dice, hausdorff_distance_95, average_surface_distance
 
 BACKGROUND_CLASS = 0
 
@@ -128,6 +133,87 @@ def evaluate_dataset(pred_folder: Path, gt_pattern: str, num_classes: Optional[i
     return rows
 
 
+def evaluate_confusion_matrices(pred_folder: Path, gt_pattern: str, n_classes: int) -> dict[str, np.ndarray]:
+    """Per-patient voxel-count confusion matrices, rows = ground truth, columns = prediction."""
+    matrices = {}
+    for pid in tqdm_(match_patients(pred_folder, gt_pattern)):
+        gt_vol = load_volume(Path(gt_pattern.format(id_=pid)))
+        pred_vol = load_volume(pred_folder / f"{pid}.nii.gz")
+        matrices[pid] = confusion_matrix(gt_vol, pred_vol, n_classes=n_classes)
+
+    return matrices
+
+
+def plot_confusion_matrix(matrix: np.ndarray, names: Sequence[str], path: Path) -> None:
+    """
+    Heatmap of a confusion matrix (rows = ground truth, columns = prediction). Cells are
+    colored by their share of the ground-truth row, since raw counts are dominated by
+    background, and annotated with that share and the voxel count.
+    """
+
+    # one-hue sequential ramp, light (near 0) to dark (near 1)
+    cmap = LinearSegmentedColormap.from_list("seq_blue", ["#f4f8fd", "#cde2fb", "#86b6ef", "#3987e5",
+                                                          "#1c5cab", "#0d366b"])
+    row_totals = matrix.sum(axis=1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        shares = np.where(row_totals > 0, matrix / row_totals, np.nan)  # NaN: organ absent from the GT
+
+    k = len(names)
+    fig, ax = plt.subplots(figsize=(1.6 * k + 2, 1.3 * k + 1.5))
+    image = ax.imshow(np.ma.masked_invalid(shares), cmap=cmap, vmin=0, vmax=1)
+    ax.set_facecolor("#ececea")  # rows without ground truth
+
+    for i in range(k):
+        for j in range(k):
+            if np.isnan(shares[i, j]):
+                text, color = "no GT", "#6b6b68"
+            else:
+                text = f"{100 * shares[i, j]:.1f}%\n{matrix[i, j]:,}"
+                color = "white" if shares[i, j] > 0.5 else "#1f1f1e"
+            ax.text(j, i, text, ha="center", va="center", fontsize=8, color=color)
+
+    ax.set_xticks(range(k), names, rotation=30, ha="right")
+    ax.set_yticks(range(k), names)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Ground truth")
+    ax.set_title("Confusion matrix (voxels, summed over patients)", loc="left", fontsize=11)
+
+    # 2px white gaps between cells
+    ax.set_xticks(np.arange(k + 1) - 0.5, minor=True)
+    ax.set_yticks(np.arange(k + 1) - 0.5, minor=True)
+    ax.grid(which="minor", color="white", linewidth=2)
+    ax.tick_params(which="both", length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Share of ground-truth voxels")
+    colorbar.outline.set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def save_confusion_matrices(matrices: dict[str, np.ndarray], class_names: Sequence[str],
+                            dest: Path) -> tuple[Path, Path]:
+    """
+    Saves <dest>_confusion_matrix.npz (patient id -> (K, K) matrix) and
+    <dest>_confusion_matrix.png (a plot of the matrix summed over all patients).
+    """
+    npz_dest = dest.with_name(f"{dest.stem}_confusion_matrix.npz")
+    png_dest = dest.with_name(f"{dest.stem}_confusion_matrix.png")
+    npz_dest.parent.mkdir(parents=True, exist_ok=True)
+
+    np.savez(npz_dest, **matrices)
+
+    total = sum(matrices.values())
+    names = [class_name(c, class_names) for c in range(total.shape[0])]
+    plot_confusion_matrix(total, names, png_dest)
+
+    return npz_dest, png_dest
+
+
 def summarize(rows: Sequence[dict], metrics: Sequence[str]) -> list[dict]:
 
     metric_names = list(metrics)
@@ -187,6 +273,13 @@ def main(args: argparse.Namespace) -> None:
 
     print_summary(summary, args.metrics)
 
+    if args.confusion_matrix:
+        n_classes = args.num_classes or len(args.class_names)
+        matrices = evaluate_confusion_matrices(args.pred_folder, args.gt_pattern, n_classes)
+        npz_dest, png_dest = save_confusion_matrices(matrices, args.class_names, dest)
+        print(f"Saved per-patient confusion matrices to {npz_dest}")
+        print(f"Saved plot of the confusion matrix summed over patients to {png_dest}")
+
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluation parameters")
@@ -199,7 +292,7 @@ def get_args() -> argparse.Namespace:
                              "--source_scan_pattern). E.g. 'data/segthor_gt_val/{id_}.nii.gz' for a "
                              "flat folder, or 'data/segthor_part1/train/{id_}/GT.nii.gz' to read "
                              "directly from the raw nested layout with no copying step.")
-    parser.add_argument("--metrics", nargs="*", default=["dice", "hausdorff_distance_95", "average_surface_distance"],
+    parser.add_argument("--metrics", nargs="*", default=list(METRIC_FUNCS), choices=list(METRIC_FUNCS),
                         help="List of metrics to compute. Default is all.")
     parser.add_argument("--num_classes", type=int, default=None,
                         help="Total number of classes, including background. "
@@ -211,6 +304,10 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--gpu", action="store_true",
                         help="Compute HD95/ASSD on the GPU. Needs CUDA plus cuCIM and CuPy; "
                              "falls back to CPU otherwise. Dice always runs on CPU.")
+    parser.add_argument("--confusion_matrix", action="store_true",
+                        help="Also save voxel-count confusion matrices (rows = ground truth, columns = "
+                             "prediction): <dest>_confusion_matrix.npz with one matrix per patient id, and "
+                             "<dest>_confusion_matrix.png, a plot of the matrix summed over all patients.")
     parser.add_argument("--dest", type=Path, required=True,
                         help="Output path for the per-patient-per-class results CSV. "
                              "The per-class summary is saved alongside it as <dest>_summary.csv")
